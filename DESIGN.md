@@ -9,8 +9,8 @@ term used in this document.
 ## 1. What the system does
 
 A batch pipeline you run once a day, after the US market closes. It reads 9 years of daily
-price history for 50 stocks and tells you, for each one: buy, sell-short, or do nothing —
-and if you trade, the exact prices at which to exit.
+price history for a list of stocks you choose and tells you, for each one: buy, sell-short,
+or do nothing — and if you trade, the exact prices at which to exit.
 
 ```
 $ make daily
@@ -35,7 +35,7 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 | Setting | Value |
 |---|---|
 | Market | US stocks (no ETFs as trading candidates) |
-| Universe | 50 tickers you supply, spread across sectors |
+| Universe | ~15 tickers you supply (any size you like — §5) |
 | Data source | `yfinance`, daily bars, 9 years |
 | Execution venue | IQ Option stock CFDs, 10× leverage |
 | Style | Swing trading — hold across days |
@@ -51,7 +51,7 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 
 | Stage | What it is, in engineering terms | Cost |
 |---|---|---|
-| **1. Fetch** | `yf.download()` 9 years of daily OHLCV for 50 tickers | ~1–3 min |
+| **1. Fetch** | `yf.download()` 9 years of daily OHLCV | ~20–60 s |
 | **2. Features** | `map` ~100 pure functions over each series → one wide numeric matrix | seconds |
 | **3. Chart** | Render price + every indicator to interactive HTML so you can read it | seconds |
 | **4. Dataset** | Add target columns by simulating each trade | seconds |
@@ -112,7 +112,7 @@ works.
 |---|---|
 | **Indicator** | A pure function over a window of past bars returning one number per bar: `f: List[Bar] -> float`. That's all any of them are, including the ones with mystical names. |
 | **SMA / EMA** | Simple / Exponential Moving Average over N days. A low-pass filter on a noisy signal; `EMA` weights recent days more. |
-| **ATR** (Average True Range) | **The most important one.** Roughly the average high-to-low distance over the last 14 days — a volatility measure, in dollars. A $500 stock might have ATR $12; a $20 stock, $0.40.<br><br>We use ATR as a **unit of distance**, like using standard deviations instead of raw values. "Put the stop 1 ATR away" means "one typical day's movement away", which is automatically the right size for both of those stocks. This is how one rule works across all 50 tickers. |
+| **ATR** (Average True Range) | **The most important one.** Roughly the average high-to-low distance over the last 14 days — a volatility measure, in dollars. A $500 stock might have ATR $12; a $20 stock, $0.40.<br><br>We use ATR as a **unit of distance**, like using standard deviations instead of raw values. "Put the stop 1 ATR away" means "one typical day's movement away", which is automatically the right size for both of those stocks. This is how one rule works across every ticker in the universe. |
 | **Oscillator** | An indicator bounded to a fixed range (usually 0–100) measuring how overextended a recent move is. RSI, Stochastic, MFI, CCI are variations. Convenient because they're already normalized. |
 | **Trend indicator** | Measures direction and/or strength of a sustained move. EMA slope, ADX, Aroon, Supertrend. |
 | **Volume indicator** | Combines price with volume, on the theory that a move backed by heavy trading is more meaningful. OBV, MFI, VWAP. |
@@ -245,11 +245,12 @@ trading-decision-maker/
 ├── requirements.txt
 │
 ├── config/
-│   ├── universe.txt             # your 50 tickers, one per line
+│   ├── universe.txt             # your tickers, one per line
 │   ├── config.toml              # horizons, ATR multiples, costs, account (§14)
 │   └── feature_sets/
-│       ├── core.toml            # the 41 CORE features (§6.3)
-│       └── extended.toml        # + the other ~77
+│       ├── minimal.toml         # 18 features — the default at ~15 tickers (§6.3)
+│       ├── core.toml            # 40 features
+│       └── extended.toml        # ~117 features
 │
 ├── src/tdm/
 │   ├── __init__.py              # venv guard
@@ -406,19 +407,60 @@ is correct forever.
 
 ### The universe is your input
 
-`config/universe.txt` holds your 50 tickers. Two requirements on the list:
+`config/universe.txt` is a plain list of tickers, one per line. Any length — the pipeline
+doesn't care, but the *statistics* do, and the table below is the honest version.
 
-- **Spread across sectors.** 50 names that all move together deliver far less than 50
-  tickers' worth of independent information. Aim for coverage: tech, financials,
-  healthcare, energy, industrials, consumer, utilities, materials.
-- **Include some that did badly** over the window. This is the only practical lever
-  against survivorship bias (§9.4 #6) — a list of today's winners was selected *because*
-  they went up, and a model trained only on those learns that buying always works.
+```
+NVDA
+AMD
+JPM
+XOM
+UNH
+...
+```
 
 **Benchmarks are appended automatically.** The relative-strength and market-regime features
-(§6.3) need SPY and sector ETFs, so `fetch` adds them and tags them `tradeable=False`.
-They flow through features like any other series and are filtered out at the decision step
+(§6.3) need SPY and sector ETFs, so `fetch` adds them and tags them `tradeable=False`. They
+flow through features like any other series and are filtered out at the decision step
 (§11). You list only what you want to trade.
+
+### How universe size affects what you can conclude
+
+Effective sample count is `tickers × 227` (§9.1 explains why it isn't the row count). That
+number governs how many features you can use and how much the final verdict is worth:
+
+| Tickers | Effective samples | Holdout | Feature set | What you get |
+|---|---|---|---|---|
+| 1–3 | 230–680 | ~50 | — | ⚠️ **Charts only.** Too few samples to fit anything that generalizes. The pipeline runs; the model output is noise. |
+| 5–10 | 1,100–2,300 | 125–250 | `minimal` (18) | A depth-3 tree. Treat any result as a hypothesis, not a finding. |
+| **15** | **~3,400** | **~375** | **`minimal` (18)** | **Workable.** Enough to train and to see whether there's signal. Holdout gives a *direction*, not a verdict. |
+| 30 | ~6,800 | ~750 | `core` (40) | Holdout starts to mean something. |
+| 50+ | ~11,400+ | ~1,250+ | `core`, then `extended` | A holdout verdict you can act on. |
+
+> **At 15 tickers, two things follow and both are in the design:**
+>
+> 1. **Use the `minimal` feature set, not `core`.** 3,400 effective samples ÷ 40 features
+>    is ~85 samples per feature, which is thin; ÷ 18 features is ~190, which is defensible.
+>    §6.3 lists which 18.
+> 2. **The 12-month holdout carries ~375 effective samples, and once §11's threshold filters
+>    most bars out the surviving *trade* count will be under the ~100-trade minimum from
+>    §9.3.** So the holdout tells you the sign of the edge, not its size. **This makes
+>    `decisions.jsonl` (§11) relatively more important** — it's how you accumulate real
+>    out-of-sample evidence over the following months that the holdout can't give you
+>    up front.
+>
+> Neither is a blocker. They just mean "promising" is the best verdict available at this
+> size, and the self-scoring log is what eventually upgrades it.
+
+> ⚠️ **Below ~10 tickers, the cross-sectional features degenerate.** `rs_rank` is a
+> percentile *across the universe* on each day — with 2 tickers it can only ever be 0 or 1,
+> and with 1 it's a constant. Same for `breadth_above_ema50`. The feature registry drops
+> both automatically when `len(universe) < 10` and logs that it did. `rs_spy_63` still
+> works at any size, since it's measured against SPY rather than against peers — so you
+> don't lose relative strength entirely, just the cross-sectional ranking of it.
+
+If you want to add tickers later, do it — more is strictly better for the statistics, and
+the only cost is a slightly longer fetch. There's no schema to migrate (§5).
 
 ### Validate before downloading
 
@@ -437,13 +479,13 @@ tdm universe validate
 ### Other practical details
 
 - **Retries.** 3 attempts with exponential backoff. If a ticker still fails, drop it with a
-  loud warning and continue — one bad symbol shouldn't kill a 50-ticker run.
+  loud warning and continue — one bad symbol shouldn't kill the whole run.
 - **Validate what comes back** before computing on it: `high >= low`, `high >= open/close`,
   no negative prices, no duplicate dates, sorted index, no all-zero-volume stretches.
   Cheap, and it catches provider glitches before they become confusing indicator values.
 
 ```bash
-tdm fetch                              # all 50, 9 years
+tdm fetch                              # everything in universe.txt, 9 years
 tdm fetch --symbols NVDA,AMD --years 9
 ```
 
@@ -481,7 +523,7 @@ any feature on a synthetic 50-row DataFrame.
 
 A decision tree learns literal threshold comparisons: `if macd > 1.84`. If a feature is
 measured in dollars, that rule is specific to one ticker at one price level and transfers
-to nothing. Train across 50 tickers and such features contribute pure noise.
+to nothing. Train across a multi-ticker universe and such features contribute pure noise.
 
 The everyday analogy: alerting on raw bytes-free instead of percent-free across a fleet of
 different disk sizes. "Alert below 10 GB" is meaningless when the disks range from 50 GB to
@@ -519,26 +561,39 @@ The list answers six questions in sequence, which is what a swing trade actually
 
 If a candidate feature doesn't help answer one of those, it shouldn't be in the list.
 
-> #### ⚠️ Build CORE first
+> #### ⚠️ Match the feature count to the universe size
 >
-> The full list is **~118 features**. Against ~11,350 effective samples (§9.1) that's ~100
-> samples per feature — thin, and an invitation to overfit.
+> The full list is **~118 features**. At 15 tickers you have ~3,400 effective samples
+> (§9.1), so using all of them would be ~29 samples per feature — hopeless. Even the
+> 40-feature CORE set is ~85 per feature, which is thin.
 >
-> So it's split into **CORE (41)** and **EXTENDED (~77)**. Build and validate CORE first,
-> and add EXTENDED only once CORE shows signal above base rate. **If CORE shows nothing,
-> more features won't rescue it** — they'll just make the overfitting harder to detect.
+> So there are three tiers, and the right one depends on how many tickers you're running:
+>
+> | Tickers | Set | Features | Samples per feature |
+> |---|---|---|---|
+> | 5–20 | **`minimal`** | **18** | ~190 at 15 tickers ✓ |
+> | 20–40 | `core` | 40 | ~170 at 30 tickers ✓ |
+> | 40+ | `core`, then `extended` | 40 → ~117 | ~285 / ~97 at 50 tickers |
+>
+> **At the planned 15 tickers, use `minimal`.** Add features only after the smaller set
+> shows signal above base rate — **if `minimal` shows nothing, more features won't rescue
+> it**, they'll just make the overfitting harder to detect. The `minimal` 18 are marked
+> **MIN** in the tables below.
+>
+> Rule of thumb: keep **≥100 effective samples per feature**. `tdm dataset build` warns
+> when the selected set violates it for your universe.
 
 #### 1 · TREND
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `close_vs_ema21/50/200` | 21, 50, 200 | `close/EMA − 1` | 200 | **CORE** |
+| `close_vs_ema21/50/200` | 21, 50, 200 | `close/EMA − 1` | 200 | **MIN** |
 | `close_vs_ema8` | 8 | `close/EMA − 1` | 8 | EXT |
-| `ema_stack` | 8/21/50/200 | ordinal 0–4: how many are in ascending order | 200 | **CORE** |
+| `ema_stack` | 8/21/50/200 | ordinal 0–4: how many are in ascending order | 200 | **MIN** |
 | `ema21_slope_atr` | 21, 5-bar slope | slope ÷ ATR | 26 | **CORE** |
 | `ema_cross_age` | 8×21 | signed bars since last cross | 21 | EXT |
-| `adx_14` | 14 | raw 0–100 ✓ — trend *strength*, no direction | 28 | **CORE** |
-| `di_diff` | 14 | `(+DI − −DI)` — the direction half | 28 | **CORE** |
+| `adx_14` | 14 | raw 0–100 ✓ — trend *strength*, no direction | 28 | **MIN** |
+| `di_diff` | 14 | `(+DI − −DI)` — the direction half | 28 | **MIN** |
 | `aroon_up/down/osc` | 25 | raw 0–100 ✓ — measures *time since* extremes | 25 | EXT |
 | `supertrend_state` | 10, 3×ATR | −1 / +1 | 24 | **CORE** |
 | `supertrend_dist_atr` | 10, 3×ATR | distance to flip ÷ ATR | 24 | EXT |
@@ -554,13 +609,13 @@ Computed against SPY and sector ETFs, which are fetched but never traded (§5).
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `rs_spy_21/63` | 21, 63 | ROC of `(close/SPY)` | 63 | **CORE** |
+| `rs_spy_21/63` | 21, 63 | ROC of `(close/SPY)` | 63 | **MIN** |
 | `rs_spy_126` | 126 | same | 126 | EXT |
-| `rs_rank` | 63 | **cross-sectional percentile** of `rs_spy_63` across the universe, per day | 63 | **CORE** |
+| `rs_rank` | 63 | **cross-sectional percentile** of `rs_spy_63` across the universe, per day | 63 | **MIN** |
 | `rs_sector_63` | 63 | ROC of `(close/sector ETF)` | 63 | EXT |
 | `beta_spy_63` | 63 | regression beta | 63 | EXT |
 | `corr_spy_63` | 63 | correlation −1..1 ✓ | 63 | EXT |
-| `spy_above_ema200` | 200 | 0/1 | 200 | **CORE** |
+| `spy_above_ema200` | 200 | 0/1 | 200 | **MIN** |
 | `spy_vol_rank` | 21, 252 | percentile of SPY realized vol | 252 | **CORE** |
 | `vix_rank` | 252 | percentile of VIX | 252 | **CORE** |
 | `vix_level` | — | raw | 1 | EXT |
@@ -575,12 +630,12 @@ Computed against SPY and sector ETFs, which are fetched but never traded (§5).
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `rsi_14` | 14 | raw 0–100 ✓ | 14 | **CORE** |
-| `rsi_2` | 2 | raw 0–100 ✓ — short-term pullback depth | 2 | **CORE** |
+| `rsi_14` | 14 | raw 0–100 ✓ | 14 | **MIN** |
+| `rsi_2` | 2 | raw 0–100 ✓ — short-term pullback depth | 2 | **MIN** |
 | `rsi_divergence` | from pivots | −1 / 0 / +1 (§6.4) | ~60 | EXT |
 | `stoch_k`, `stoch_d` | 14,3,3 | raw 0–100 ✓ | 17 | **CORE** |
 | `stoch_kd_diff` | 14,3,3 | `%K − %D` | 17 | EXT |
-| `macd_hist_atr` | 12,26,9 | histogram ÷ ATR | 35 | **CORE** |
+| `macd_hist_atr` | 12,26,9 | histogram ÷ ATR | 35 | **MIN** |
 | `macd_line_atr`, `macd_signal_atr` | 12,26,9 | ÷ ATR | 35 | EXT |
 | `macd_cross_age` | 12,26,9 | signed bars since cross | 35 | EXT |
 | `ppo` | 12,26 | `(EMA12−EMA26)/EMA26 × 100` — inherently scale-free, a cleaner MACD | 26 | EXT |
@@ -596,11 +651,11 @@ Computed against SPY and sector ETFs, which are fetched but never traded (§5).
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `atr_pct` | 14 | `ATR/close` | 14 | **CORE** |
-| `atr_pct_rank` | 14, 252 | trailing percentile | 252 | **CORE** |
-| `bb_pctb` | 20, 2σ | `(C−lower)/(upper−lower)` | 20 | **CORE** |
+| `atr_pct` | 14 | `ATR/close` | 14 | **MIN** |
+| `atr_pct_rank` | 14, 252 | trailing percentile | 252 | **MIN** |
+| `bb_pctb` | 20, 2σ | `(C−lower)/(upper−lower)` | 20 | **MIN** |
 | `bb_bandwidth` | 20, 2σ | `(upper−lower)/mid` | 20 | **CORE** |
-| `bb_bandwidth_rank` | 20, 252 | percentile — low = squeeze | 252 | **CORE** |
+| `bb_bandwidth_rank` | 20, 252 | percentile — low = squeeze | 252 | **MIN** |
 | `donchian_pos_20` | 20 | position in channel 0–1 ✓ | 20 | **CORE** |
 | `donchian_pos_55` | 55 | same | 55 | EXT |
 | `pct_from_52w_high` | 252 | `close/max(high,252) − 1` | 252 | **CORE** |
@@ -618,11 +673,11 @@ Computed against SPY and sector ETFs, which are fetched but never traded (§5).
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `volume_rel_median` | 20 | `log(volume / median20)` | 20 | **CORE** |
+| `volume_rel_median` | 20 | `log(volume / median20)` | 20 | **MIN** |
 | `volume_z` | 63 | trailing z-score | 63 | EXT |
 | `obv_slope_z` | 21 slope, 252 z | see note below | 252 | **CORE** |
 | `obv_price_divergence` | 21 | sign disagreement between OBV slope and price slope | 252 | EXT |
-| `mfi_14` | 14 | raw 0–100 ✓ — volume-weighted RSI | 14 | **CORE** |
+| `mfi_14` | 14 | raw 0–100 ✓ — volume-weighted RSI | 14 | **MIN** |
 | `ad_slope_z` | 21, 252 | Chaikin A/D line slope, z-scored | 252 | EXT |
 | `cmf_20` | 20 | Chaikin Money Flow, bounded ✓ | 20 | EXT |
 | `close_vs_rvwap_20` | 20 | `close/rolling VWAP − 1` | 20 | **CORE** |
@@ -686,7 +741,7 @@ def pivots(bars, threshold) -> list[Pivot]:
 
 | Feature | Stored as | Tier |
 |---|---|---|
-| `dow_trend` | −1 / 0 / +1: `+1` if the last two swing highs **and** last two swing lows are both rising, `−1` if both falling | **CORE** |
+| `dow_trend` | −1 / 0 / +1: `+1` if the last two swing highs **and** last two swing lows are both rising, `−1` if both falling | **MIN** |
 | `dow_trend_age` | bars since it last changed | **CORE** |
 | `dist_to_swing_high_atr` | distance to the last confirmed swing high ÷ ATR | **CORE** |
 | `dist_to_swing_low_atr` | same, swing low | EXT |
@@ -716,7 +771,7 @@ def pivots(bars, threshold) -> list[Pivot]:
 |---|---|---|
 | `clv` | `(close−low)/(high−low)` — where in the day's range it closed | **CORE** |
 | `gap_atr` | `(open − prev close)/ATR` | **CORE** |
-| `large_gap_due` | 0/1 — the earnings proxy, see below | **CORE** |
+| `large_gap_due` | 0/1 — the earnings proxy, see below | **MIN** |
 | `range_atr` | `(high−low)/ATR` | EXT |
 | `consec_updown` | signed run length of up/down closes | EXT |
 | `days_since_large_gap` | bars since a gap exceeded 3×ATR | EXT |
@@ -740,16 +795,19 @@ def pivots(bars, threshold) -> list[Pivot]:
 
 #### Totals
 
-| Family | CORE | EXTENDED |
-|---|---|---|
-| Trend | 8 | 17 |
-| Relative & market | 6 | 8 |
-| Momentum | 7 | 12 |
-| Volatility | 7 | 11 |
-| Volume | 6 | 10 |
-| Structure | 3 | 12 |
-| Bar shape & calendar | 3 | 7 |
-| **Total** | **40** | **77** |
+| Family | MIN | CORE | EXTENDED |
+|---|---|---|---|
+| Trend | 4 | 8 | 17 |
+| Relative & market | 3 | 6 | 8 |
+| Momentum | 3 | 7 | 12 |
+| Volatility | 4 | 7 | 11 |
+| Volume | 2 | 6 | 10 |
+| Structure | 1 | 3 | 12 |
+| Bar shape & calendar | 1 | 3 | 7 |
+| **Total** | **18** | **40** | **77** |
+
+`MIN ⊂ CORE ⊂ CORE+EXTENDED`. The 18 MIN features are the highest-conviction member of
+each family — enough to answer all six questions above with the fewest columns.
 
 > #### If you only implement five
 >
@@ -1145,9 +1203,9 @@ Standard CV treats them as if they were, which inflates every metric. Two correc
   `sample_weight` so crowded periods don't dominate.
 - **Purging and embargo** in cross-validation — §9.2.
 
-**Practical consequence:** 50 tickers × ~2,268 bars ≈ 113,000 rows, but the **effective
-independent sample count is ~11,350.** That smaller number is what governs model
-complexity.
+**Practical consequence:** 15 tickers × ~2,268 bars ≈ 34,000 rows, but the **effective
+independent sample count is ~3,400.** That smaller number is what governs model
+complexity, and it's why §6.3 recommends 18 features rather than 118.
 
 ### 8.3 The parameter sweep
 
@@ -1210,7 +1268,7 @@ modeling at all:
   biases the estimates — CatBoost's authors call this *prediction shift*, and it's a subtle
   form of overfitting that worsens as data gets smaller and noisier. Ordered boosting
   estimates gradients from models trained on data *excluding* the row being evaluated. On
-  ~11,350 effective samples of very low signal-to-noise data, that's exactly the right
+  ~3,400 effective samples of very low signal-to-noise data, that's exactly the right
   correction.
 - **Oblivious (symmetric) trees** by default — every node at a given depth splits on the
   same feature. A strong structural regularizer, which is what you want when noise
@@ -1267,16 +1325,17 @@ is worth the 20 minutes it costs to run all three.
 |---|---|
 | 9 years × ~252 sessions | ~2,268 bars per ticker |
 | ÷ horizon 10 (labels overlap — §8.2) | ~227 **effective independent** samples per ticker |
-| × 50 tickers | **~11,350 effective samples** |
+| × 15 tickers | **~3,400 effective samples** |
 
-The row count will *look* like ~113,000. The information content is ~11,350, and that's
-what should govern model complexity — hence `depth=4` and strong `l2_leaf_reg` rather than
-the defaults.
+The row count will *look* like ~34,000. The information content is ~3,400, and that's what
+should govern model complexity — hence `depth=4`, strong `l2_leaf_reg`, and the 18-feature
+`minimal` set (§6.3) rather than the defaults and the full list.
 
-**`effective samples ≈ tickers × years × 25`.** Years and tickers trade off directly. At
-50 × 9 there's enough to justify a regularized boosted model and to get a holdout verdict
-that means something — provided the 50 are **spread across sectors** (§5), since names that
-all move together deliver far less independent information than the count suggests.
+**`effective samples ≈ tickers × years × 25`.** Years and tickers trade off directly, so
+adding tickers is the cheapest way to buy statistical power — see §5 for what each universe
+size gets you. Note also that tickers which all move together deliver less independent
+information than the count suggests, so a spread across sectors is worth more than the same
+number of names from one industry.
 
 ### One global model, no ticker identity
 
@@ -1341,9 +1400,15 @@ fold 3:  |=========== train =======| purge | embargo |== test ==|
   to read it without an explicit `--unlock-holdout` flag, which exists to make the peek a
   deliberate act you'll remember.
 
-> The holdout governs what your final verdict is worth. 12 months is ~25 effective samples
-> per ticker, so at 50 tickers it carries ~1,250 — comfortably past the ~100-trade minimum
-> below, even after §11's threshold filters most bars out. The go/no-go will mean something.
+> ⚠️ **The holdout governs what your final verdict is worth, and at 15 tickers it is thin.**
+> 12 months is ~25 effective samples per ticker, so 15 tickers carries ~375 — and once
+> §11's threshold filters most bars out, the surviving *trade* count lands below the
+> ~100-trade minimum in §9.3.
+>
+> So the holdout will tell you the **sign** of the edge, not its size. "Promising" is the
+> best verdict available at this universe size, and that's fine — it just means
+> `decisions.jsonl` (§11) is where the real evidence accumulates afterwards. If you later
+> want a verdict you can size up on, add tickers (§5), not years.
 
 ### 9.3 Metrics
 
@@ -1724,9 +1789,12 @@ Worth calibrating before you see a number, so you can tell success from self-dec
   short setups have a worse base rate. CFDs remove the mechanical obstacles but not the
   drift. If `M_short` shows no out-of-sample edge, **ship long-only.** That's a finding, not
   a defeat.
-- **Report confidence intervals on the hit rate, not just the point estimate.**
-  Distinguishing 40% from 45% needs on the order of a thousand independent trades. If the
-  interval straddles 42%, the honest readout is "inconclusive", not "profitable".
+- ⚠️ **Report confidence intervals on the hit rate, not just the point estimate — and at
+  15 tickers expect them to be wide.** Distinguishing a 40% hit rate from 45% needs on the
+  order of a thousand independent trades; the 12-month holdout will have well under a
+  hundred (§9.2). **If the interval straddles 42%, the honest readout is "inconclusive",
+  not "profitable".** That is the most likely outcome of the first full run, and it is not
+  a failure — it's the point at which `decisions.jsonl` starts earning its keep.
 
 ---
 
@@ -1737,8 +1805,8 @@ Each phase ends somewhere useful, so you can stop or re-scope without a half-bui
 | Phase | Deliverable | Done when |
 |---|---|---|
 | **0 · Scaffold** | venv 3.14, `CLAUDE.md`, Makefile, test runner | `make venv && make test` green; the venv guard fires outside the venv |
-| **1 · Fetch** | `yf.download` wrapper, `universe validate`, OHLCV sanity checks, Parquet snapshot | 9 years × 50 tickers lands clean. ⚠️ **Smoke-test yfinance against pandas 3.1 here** (§3) — the one unverified dependency |
-| **2 · Indicators** | registry + the 40 CORE features, Parquet output, CSV export | `test_indicators.py` green; `test_invariance.py` green (§5) |
+| **1 · Fetch** | `yf.download` wrapper, `universe validate`, OHLCV sanity checks, Parquet snapshot | 9 years × your tickers lands clean. ⚠️ **Smoke-test yfinance against pandas 3.1 here** (§3) — the one unverified dependency |
+| **2 · Indicators** | registry + the 18 `minimal` features, Parquet output, CSV export | `test_indicators.py` green; `test_invariance.py` green (§5) |
 | **3 · Charts** | Plotly multi-panel HTML per ticker (§7) | **you open `NVDA.html` and the indicators look right.** This gates phases 1–2 — do not proceed past a chart that looks wrong |
 | **4 · Structure features** | ZigZag + Dow/Elliott with `confirmed_at` | `test_leakage.py` pivot tests green, **and the pivots look right on the chart** |
 | **5 · Dataset** | triple barrier, `t1`, weights, `fwd_*` columns, `labels sweep` | base rate / timeout fraction / ambiguity rate sane; **TP/SL brackets look sane on the chart** (`--with-labels`) |
@@ -1755,7 +1823,7 @@ a chart and nearly undetectable in a metric. A model trained on quietly broken f
 still produces a plausible-looking number, which is the worst outcome available.
 
 **If you only reach phase 3**, you still have a reproducible feature pipeline and readable
-charts of all 50 tickers — a useful analysis tool on its own, independent of any model.
+charts of every ticker — a useful analysis tool on its own, independent of any model.
 
 ---
 
@@ -1765,7 +1833,7 @@ charts of all 50 tickers — a useful analysis tool on its own, independent of a
 # config/config.toml
 
 [universe]
-file        = "config/universe.txt"   # your 50 tickers
+file        = "config/universe.txt"   # your tickers — any number (§5)
 benchmark   = "SPY"                   # appended automatically, tradeable=false
 years       = 9
 
@@ -1796,7 +1864,8 @@ earnings_calendar = false             # real calendar, if you later add a data s
 
 [model]
 primary         = "catboost"
-features        = "core"              # core | extended
+features        = "minimal"           # minimal | core | extended — match to
+                                      # universe size (§6.3)
 holdout_months  = 12
 embargo_bars    = 10
 ```
@@ -1805,8 +1874,54 @@ embargo_bars    = 10
 
 | Setting | Current | When to change it |
 |---|---|---|
-| `max_concurrent` | 10 | Lower to 5 if "−10% in a day" (§10.2) is more than you want |
+| `max_concurrent` | 10 | Lower to 5 if "−10% in a day" (§10.2) is more than you want. Note it can't bind above your ticker count |
 | `costs.*` | estimates | As soon as you can read your real spread and overnight fee off the platform — they move break-even by ~8 points (§10.3) |
 | `k_tp` / `k_sl` | 2.0 / 1.0 | After `labels sweep` — wider profiles amortize fixed costs better |
-| `features` | `core` | Once CORE shows signal above base rate (§6.3) |
+| `features` | `minimal` | Move to `core` once `minimal` shows signal, or if you grow the universe past ~20 tickers (§6.3) |
+| `universe` | ~15 tickers | Adding tickers is the cheapest way to buy statistical power and the only way to get a holdout verdict you can size up on (§5) |
 | `earnings_calendar` | `false` | Before sizing up — a real calendar beats the proxy, and earnings is the only knowable tail risk (§10.4) |
+
+---
+
+## 15. Iteration speed
+
+If a run feels slow, it is almost certainly **not** the download. 15 tickers × 9 years of
+daily bars is ~34,000 rows — a small HTTP payload that lands in well under a minute. Where
+the time actually goes:
+
+| Stage | Cost | Why |
+|---|---|---|
+| Fetch | ~20–60 s | small payload, batched and threaded |
+| Features | seconds | TA-Lib over 34k rows |
+| Dataset / barriers | seconds | one pass per row |
+| **Train** | **minutes** | ← **the real cost** |
+
+Training dominates because one experiment is **12 model fits**: 6 walk-forward folds ×
+2 directions (long and short), and `boosting_type="Ordered"` is 2–4× slower than plain
+boosting.
+
+### The cheap levers, in order
+
+**1. The dataset snapshot already removes fetch from the loop.** `tdm dataset build` writes
+Parquet keyed by config hash (§5); every subsequent `tdm train` reads that file. You pay
+the download once, then iterate offline. This is the single biggest win and it's automatic.
+
+**2. Use a fast profile while exploring, the real one to conclude:**
+
+```bash
+tdm train --fast      # 3 folds, boosting_type="Plain", iterations=500
+tdm train             # 6 folds, Ordered, iterations=3000
+```
+
+`--fast` is for "does this feature help at all?" — roughly 10× quicker and directionally
+honest. Never report a `--fast` number as a result, and never use one to make the
+phase-11 go/no-go call.
+
+**3. Train one direction while iterating.** `--side long` halves the work, and per §12 the
+long side is where the edge is more likely to be anyway.
+
+> ⚠️ **Don't cut tickers to save time.** It's the most expensive lever available: fetch
+> time scales with ticker count but is already negligible, while *statistical power* scales
+> with it and is the scarce resource (§5). Dropping from 50 to 15 saves perhaps 40 seconds
+> of download and costs you the ability to draw a conclusion from the holdout. Cut folds,
+> cut iterations, cut one direction — not tickers.

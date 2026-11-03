@@ -60,6 +60,7 @@ finance background — **§2 is a glossary** defining every domain term.
 | §10 | backtest, venue, costs, position sizing |
 | §11 | the daily decision |
 | §14 | configuration reference |
+| §15 | iteration speed — what to cut when a run feels slow |
 
 When you change behaviour, update the relevant section in the same commit.
 
@@ -87,45 +88,52 @@ warm-up periods filled with 0 instead of NaN, features that are flat for 200 bar
    `run_id = hash(tickers, date range, feature config, code version)`, plus a line in
    `runs.jsonl`. This exists so two model runs are comparable; without it you cannot tell a
    worse model from a changed dataset. (§5)
-3. **Every feature must be scale-free** — a ratio, a bounded oscillator, or a trailing
+3. **Match the feature set to the universe size.** `minimal` (18) at ~15 tickers, `core`
+   (40) at 20–40, `extended` beyond that. Keep ≥100 effective samples per feature; at 15
+   tickers that is ~3,400 ÷ 18. Using all ~118 features on a small universe is ~29 samples
+   per feature and will overfit silently. (§6.3, §5)
+4. **Don't cut tickers to make a run faster.** Fetch is already negligible; training
+   dominates. Cut CV folds, use `--fast` (Plain boosting, fewer iterations), or train one
+   direction. Ticker count is statistical power and it is the scarce resource. (§15)
+5. **Every feature must be scale-free** — a ratio, a bounded oscillator, or a trailing
    z-score/percentile. Never raw dollars (price, EMA, MACD, band levels) and never an
    unbounded cumulative sum (OBV). Two payoffs: tree thresholds transfer across tickers,
    and features become invariant to splits, which is what makes re-downloading safe.
    `tests/test_invariance.py` enforces it. (§6.2, §5)
-4. **No lookahead, ever.** A feature on date *d* may only use bars up to and including *d*.
+6. **No lookahead, ever.** A feature on date *d* may only use bars up to and including *d*.
    In particular: ZigZag pivots must respect `confirmed_at`; z-scores and percentile ranks
    use trailing windows only, never `.fit()` on the full series. (§6.3, §9.4)
-5. **Feature selection is an ALLOWLIST, never a denylist.** Targets and features live in
+7. **Feature selection is an ALLOWLIST, never a denylist.** Targets and features live in
    the same table, so `X = df.drop(columns=["y_long"])` silently leaves `fwd_ret_10d` in
    `X` and hands the model the answer — ~99% accuracy, no error, a backtest that looks like
    a money printer. Always `X = df[registry.feature_names()]`. Non-feature columns carry a
    mandatory prefix: `y_`, `fwd_`, `meta_`. A bare column name means it is a feature. (§8.1)
-6. **Never target an absolute price.** Predicting `close[t+1]` gives R²≈0.999 by learning
+8. **Never target an absolute price.** Predicting `close[t+1]` gives R²≈0.999 by learning
    `close[t+1]≈close[t]` — the identity function, zero tradeable information, and it looks
    like a triumph. Targets are always changes: returns, or barrier outcomes. (§8.1)
-7. **Never use plain `KFold` / `train_test_split`.** Use
+9. **Never use plain `KFold` / `train_test_split`.** Use
    `model/cv.py::PurgedWalkForwardSplit`. Labels span up to 10 future bars, so ordinary CV
    leaks test prices into training labels and every metric comes out inflated. (§9.2)
-8. **Don't touch the holdout window.** The final 12 months require an explicit
-   `--unlock-holdout` flag. No hyperparameter search, feature selection, or threshold
-   tuning against it. (§9.2)
-9. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in both
-   the simulator and the backtest. The two must never disagree. (§8.2, §10)
-10. **Filter training samples through the same gates `decide` uses.** `max_vol`,
+10. **Don't touch the holdout window.** The final 12 months require an explicit
+    `--unlock-holdout` flag. No hyperparameter search, feature selection, or threshold
+    tuning against it. (§9.2)
+11. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in both
+    the simulator and the backtest. The two must never disagree. (§8.2, §10)
+12. **Filter training samples through the same gates `decide` uses.** `max_vol`,
     `min_liquidity` and the gap filter run at sample-construction time too — otherwise you
     train on regimes you will never trade in (e.g. March 2020 at 10× leverage). (§9.1)
-11. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
+13. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
     costs and **~42% after** spread, slippage and financing. Accuracy is close to
     meaningless here. (§9.3, §10.3)
-12. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
+14. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
     affects the margin a position ties up, nothing else. Getting this backwards is how
     leveraged accounts die. (§10.2)
-13. **No ETFs in decisions, but always fetch them.** SPY and sector ETFs are benchmark
+15. **No ETFs in decisions, but always fetch them.** SPY and sector ETFs are benchmark
     inputs for the relative-strength and regime features. They carry `tradeable=False` and
     are filtered at the decision step, never at fetch. (§5, §6.3)
-14. **Long and short are one code path with a sign flip.** We trade CFDs — no share borrow,
+16. **Long and short are one code path with a sign flip.** We trade CFDs — no share borrow,
     no uptick rule, no shortability check. Don't add that logic. (§10.1)
-15. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
+17. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
     beats CatBoost on the holdout, CatBoost is overfit — report both, always. Keep the
     depth-4 tree permanently as the readable baseline. Shallow and heavily regularized:
     `depth=4`, `learning_rate=0.03`, `l2_leaf_reg≈10`, `od_type="Iter"`. Leave

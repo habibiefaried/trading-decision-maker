@@ -73,7 +73,7 @@ make label                                    # triple-barrier labels
 ./venv/bin/python -m tdm.cli dataset schema    # column list, dtypes, CORE/EXT tier
 ```
 
-The dataset is one row per `(symbol, date)`: identity, raw OHLCV, ~40 feature columns,
+The dataset is one row per `(symbol, date)`: identity, raw OHLCV, the feature columns,
 `y_*` target columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §8.1.
 
 ### Charts
@@ -97,6 +97,8 @@ make train                                     # purged walk-forward CV
 ./venv/bin/python -m tdm.cli train --model catboost         # primary
 ./venv/bin/python -m tdm.cli train --model rf               # required control
 ./venv/bin/python -m tdm.cli train --compare                # all three, same folds
+./venv/bin/python -m tdm.cli train --fast                   # quick, for iteration only
+./venv/bin/python -m tdm.cli train --side long              # halve the work
 ./venv/bin/python -m tdm.cli explain --run-id <id>          # rules + importances
 
 make backtest
@@ -116,7 +118,7 @@ make decide
 
 | File | Purpose |
 |---|---|
-| `config/universe.txt` | **your** tickers, one per line. Benchmarks (SPY etc.) added automatically |
+| `config/universe.txt` | **your** tickers, one per line, any number. Benchmarks (SPY etc.) added automatically |
 | `config/config.toml` | horizon, ATR multiples, costs, thresholds, position sizing |
 | `config/feature_sets/*.toml` | which indicators to compute |
 
