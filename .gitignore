@@ -218,3 +218,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ──────────────────────────────────────────────────────────────────────────────
+# trading-decision-maker — local data, models and reports.
+# All of this is re-derivable: data/market.db is rebuilt by `make fetch`,
+# features/labels by `make features && make label`, models by `make train`.
+# Never commit it — market.db grows to hundreds of MB and contains
+# vendor-licensed price data.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# SQLite price cache (DESIGN.md §4), Parquet features (§6), models, reports.
+# Ignore the *contents* and re-include .gitkeep, so a fresh clone still has the
+# directory skeleton to write into. Note: `data/` alone would NOT work here —
+# git doesn't descend into an excluded directory, so the negations below would
+# never be evaluated.
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# ...and belt-and-braces, in case these land outside the dirs above
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.parquet
+*.feather
