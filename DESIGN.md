@@ -57,10 +57,10 @@ Worth stating up front, because they drive most of the design decisions:
 |---|---|---|
 | **Where we actually trade** | **IQ Option, stock CFDs, 10× leverage** | User has traded there for years. This is a *derivative*, not share ownership — it changes the cost model and removes a regulatory constraint. **§11.1** |
 | What we trade | **US stocks only — no ETFs** | SPY is still *read* as a benchmark for features, but never traded (§8.2) |
-| Universe | intersection of (IQ Option's listed US stocks) ∩ (yfinance coverage) | §16 #1 — IQ Option lists on the order of ~100 US names, not thousands |
+| Universe | **user-supplied ticker list** in `config/universe.txt` | You provide the symbols, the system downloads them. No hardcoded list, no intersection logic — §7 |
 | Data source | `yfinance` (free Yahoo Finance API wrapper) | Prices come from Yahoo; execution happens at IQ Option. These differ — §11.1 |
 | Granularity | One row per trading day | |
-| History depth | **5 years** (~1,260 bars/ticker) | User's call. Has a direct consequence for sample size — §10.1 |
+| History depth | **8 years** (~2,016 bars/ticker) | Covers the 2018 correction, the 2020 COVID crash, and the 2022 bear market — §10.1 |
 | Style | **Swing trading** | Hold across days, not intraday, not months |
 | Horizon | **10 trading days max** | This is the timeout barrier — explained in §9 |
 | TP / SL | **2.0 × ATR / 1.0 × ATR** | |
@@ -713,8 +713,9 @@ make fetch     # second run: ZERO HTTP calls   <- assert this in CI
 ### CLI
 
 ```bash
+tdm universe validate                          # check the ticker list BEFORE downloading
 tdm fetch                                      # incremental, universe from config
-tdm fetch --symbols NVDA,AMD --since 2015-01-01
+tdm fetch --symbols NVDA,AMD --since 2018-11-01
 tdm fetch --dry-run                            # print the plan, make no calls
 tdm fetch --force --symbols NVDA               # ignore coverage, re-pull and UPSERT
 tdm db status                                  # coverage, gaps, staleness per symbol
@@ -724,6 +725,29 @@ tdm db verify                                  # integrity: high>=low, no negati
 
 `--dry-run` is how you test the planner without the network, and the first thing to reach
 for when a run is unexpectedly slow.
+
+### The universe is your input
+
+`config/universe.txt` is a plain list of tickers you provide, one per line. Nothing is
+hardcoded. Two things the ingest layer does with it:
+
+**1. `tdm universe validate` runs first and fails fast.** Downloading 8 years × N tickers
+takes a while, and you don't want to find out at ticker 48 that three of them were typos.
+It resolves each symbol against the provider and reports:
+
+| Check | Why |
+|---|---|
+| Symbol resolves at all | Catches typos and wrong suffixes (`BRK.B` vs `BRK-B` — Yahoo uses the dash) |
+| Has ≥ 8 years of history | ⚠️ A 2024 IPO can't give you 8 years. Flagged, not rejected — but a ticker with 300 bars contributes almost nothing and will have NaN for the 200-day features |
+| Currently active, not delisted | |
+| Median volume above the liquidity floor | A thin stock will just be gated out at decision time (§13), so it's dead weight in the universe |
+| Duplicates / blank lines | |
+
+**2. Benchmark tickers are appended automatically.** The relative-strength and regime
+features (§8.2) need SPY and the relevant sector ETFs. You list only what you want to
+*trade*; `sync` adds the benchmarks it needs with `tradeable = 0`. So "no ETFs" (§1) stays
+true of your decisions without breaking the features — and you never have to remember to
+add SPY by hand.
 
 ---
 
@@ -1188,36 +1212,82 @@ The user asked for "a simple decision tree (you can suggest as well)". My sugges
 | Alternative | `xgboost` 3.4.1 | Comparable. Worth it for monotonic constraints or GPU; otherwise it's a dependency for marginal gain. Start with HGB. |
 | Variance check | `RandomForest` / `ExtraTrees` | Cheap baseline. If it beats HGB, your HGB is overfit. |
 
-> #### Sample size: the direct consequence of choosing 5 years
+> #### Sample size: the consequence of choosing 8 years
 >
-> This governs how complex a model you can justify, so it's worth doing the arithmetic.
+> This governs how complex a model you can justify, so it's worth the arithmetic.
 >
 > | | |
 > |---|---|
-> | 5 years × ~252 sessions | **~1,260 bars per ticker** |
-> | ÷ horizon 10 (labels overlap — §9) | **~126 *effective independent* samples per ticker** |
-> | × 9 tickers (the previous universe) | **~1,100 effective samples** |
-> | × 60 tickers | **~7,600 effective samples** |
+> | 8 years × ~252 sessions | **~2,016 bars per ticker** |
+> | ÷ horizon 10 (labels overlap — §9) | **~200 *effective independent* samples per ticker** |
+> | × 9 tickers | ~1,800 effective samples |
+> | × 30 tickers | ~6,000 effective samples |
+> | × 60 tickers | ~12,000 effective samples |
 >
-> The row count will *look* like 11,000 with 9 tickers. The information content is ~1,100.
-> That's the number that should govern model complexity — and at ~1,100 you can justify a
-> depth-4 tree and little more.
+> With 9 tickers the row count *looks* like 18,000. The information content is ~1,800.
+> **That smaller number is what should govern model complexity.**
 >
 > **The key relationship: `effective samples ≈ tickers × years × 25`.** Years and tickers
-> are interchangeable for statistical power. Cutting history from 15 years to 5 divides
-> your power by 3, so **holding power constant means roughly tripling the ticker count.**
+> are interchangeable for statistical power, so the two knobs trade off directly.
 >
-> Your reasoning for 5 years — that technical setups recur across market conditions, so
-> the 2020 crash isn't essential — is defensible, and the window has a bonus you may not
-> have counted on: **5 years back from today still includes the 2022 downturn**, so you get
-> a bull market, a bear market, and the current regime. That's real diversity, not a
-> single-regime sample.
+> **8 years instead of 5 buys ~1.6× the power** — a real gain, and it costs nothing but
+> download time. It also changes what's *in* the window:
 >
-> So the recommendation isn't "use more history" — it's **"use more tickers"** (§16 #1).
-> Same power, and it attacks the survivorship problem (§10.5 #7) at the same time, which
-> adding years does not.
+> | Period | What it contributes |
+> |---|---|
+> | late 2018 | a ~20% correction |
+> | 2019 | steady bull |
+> | **Feb–Mar 2020** | **the COVID crash — a ~34% drop in five weeks** |
+> | 2020–21 | recovery and melt-up |
+> | 2022 | a ~25% bear market |
+> | 2023–26 | bull, then the current regime |
+>
+> That's two bear markets plus a volatility shock — about as much regime diversity as any
+> 8-year window could offer. You'd argued COVID wasn't essential because technical setups
+> recur; at 8 years you get it included anyway, which is a free hedge against that
+> assumption being wrong.
+>
+> **Two notes on including the COVID period:**
+>
+> 1. **ATR-scaled barriers partly self-normalize**, which is a nice property of the §9
+>    design. When volatility tripled, ATR tripled, so TP/SL distances widened
+>    proportionally rather than being blown through instantly. A fixed-percentage barrier
+>    would have behaved very differently in Mar 2020 than in Jul 2021; an ATR barrier
+>    adapts. This is a concrete payoff from the ATR choice.
+> 2. ⚠️ **But it interacts badly with 10× leverage, and that needs handling** — see the
+>    box below.
+>
+> The recommendation remains **"more tickers"** (§16 #1): 8 years is now a decent base, but
+> tickers are the knob that also attacks survivorship bias (§10.5 #7), which adding years
+> does not.
 
-**No neural networks.** Effective sample size is ~1,100–7,600 depending on universe size
+> #### ⚠️ Train on the same distribution you'll trade: filter training samples by the inference gates
+>
+> A consequence of including extreme-volatility periods, and a bug worth designing out
+> rather than discovering.
+>
+> In March 2020, `ATR/close` for a volatile stock reached ~8–10%. At 10× leverage, a 1-ATR
+> stop is then an **80–100% loss of that position's margin** — a margin wipe. So §13's
+> `max_vol` gate will correctly refuse to trade at all in those conditions.
+>
+> But if those bars stay in the *training* set, the model is learning from a regime it will
+> **never be asked to act in**, and in a 5-week stretch of violent moves those samples can
+> carry outsized influence on the fitted thresholds.
+>
+> **Rule: build the training set through the same hard gates that §13 applies at inference
+> time.** `max_vol`, `min_liquidity` and the earnings/gap filter all run at sample-
+> construction time, not just at decision time. This is the "two implementations must
+> agree" principle from §1 applied to *sample selection* rather than exit logic.
+>
+> Report the count of samples excluded by each gate, so the filtering is visible and you
+> can tell whether a gate is quietly discarding half your data.
+>
+> Note this does **not** mean deleting the COVID period from the database. The bars stay —
+> they're needed to compute indicators and regime features for the dates *after* them, and
+> the market-regime features (§8.2) still let the model learn "conditions like these are
+> dangerous." Only the *tradeable samples* are filtered.
+
+**No neural networks.** Effective sample size is ~1,800–12,000 depending on universe size
 (above). On tabular data at that scale, gradient-boosted trees consistently beat deep nets
 in published benchmarks. The previous project carried a `torch` dependency; drop it. If you
 later want sequence models, that's an argument for *more tickers first*, not a deeper
@@ -1267,18 +1337,21 @@ fold 3:  |=========== train =======| purge | embargo |== test ==|
   the peek a deliberate act you'll remember, because each peek spends a little of its
   honesty.
 
-> **Why 12 months and not 18.** With 5 years of history (§10.1) an 18-month holdout is 30%
-> of the dataset, which starves training — and training data is already the scarce
-> resource here. 12 months leaves 4 years for walk-forward CV and still gives a holdout of
-> ~25 effective samples per ticker.
+> **Why 12 months.** With 8 years of history (§10.1) a 12-month holdout is ~12.5% of the
+> data — a comfortable fraction, leaving 7 years for walk-forward CV. (At the earlier
+> 5-year plan an 18-month holdout would have been 30% and starved training; 8 years makes
+> this a non-issue.)
 >
-> ⚠️ **That is thin.** With 9 tickers the holdout holds ~225 effective samples, well under
-> the ~100-trade minimum from §10.4 once the decision threshold filters most bars out —
-> meaning **the final go/no-go verdict would itself be statistically weak.** With 60
-> tickers it's ~1,500 and the verdict means something. This is the same conclusion as
-> §10.1 reached from a different direction, and it's why §16 #1 is the most consequential
-> open question: a wider universe isn't a nice-to-have, it's what makes the evaluation
-> interpretable at all.
+> ⚠️ **The holdout is still the tightest constraint on your conclusion.** 12 months is ~25
+> effective samples per ticker, so with 9 tickers the holdout carries ~225 — and once the
+> §13 threshold filters most bars out, the surviving *trade* count can fall below the
+> ~100-trade minimum from §10.4. **That would make the final go/no-go verdict itself
+> statistically weak**, however good the training looked. With 30+ tickers it's ~750 and
+> the verdict means something.
+>
+> This is §10.1's conclusion arrived at from a different direction, and it's why §16 #1 is
+> the one open question that matters: a wider universe isn't a nice-to-have, it's what
+> makes the final evaluation interpretable at all.
 
 ### 10.4 Metrics — accuracy is the wrong objective
 
@@ -1563,12 +1636,13 @@ Worth calibrating before you see a number, so you can tell success from self-dec
   short setups have a worse base rate. CFDs remove the mechanical obstacles (§11.1) but
   not that drift. If `M_short` shows no out-of-sample edge, **ship long-only.** That's a
   finding, not a defeat.
-- **With 5 years of history, expect wide confidence intervals.** ~1,260 bars/ticker, and
-  after label-overlap weighting the effective independent sample count is roughly
-  `tickers × 126` (§10.1). With 9 tickers that's ~1,100 effective samples, which is not
-  enough to distinguish a 40% from a 45% hit rate with any confidence. **This is the
-  strongest argument for a wider universe** (§16 #1) — it's the one knob that buys
-  statistical power without needing more years.
+- **Expect wide confidence intervals, and check them.** With 8 years the effective
+  independent sample count is roughly `tickers × 200` (§10.1) — ~1,800 at 9 tickers,
+  ~6,000 at 30. Distinguishing a 40% hit rate from a 45% one needs on the order of a
+  thousand independent trades, so **report confidence intervals on the hit rate, not just
+  the point estimate.** If the interval straddles the ~42% break-even, the honest readout
+  is "inconclusive", not "profitable". **This is the strongest argument for a wider
+  universe** (§16 #1).
 
 ---
 
@@ -1692,7 +1766,8 @@ readable baseline — already enough to iterate on.
 | # | Question | Resolution |
 |---|---|---|
 | 1 | Asset class | **US stocks only, no ETFs** as trading candidates. ETFs still ingested as benchmarks with `tradeable = 0` (§8.2) |
-| 2 | History depth | **5 years.** Consequence quantified in §10.1; the window does include the 2022 downturn, so regime diversity is better than it might sound |
+| 1b | Universe source | **User-supplied ticker list** in `config/universe.txt`. No hardcoded universe, no IQ Option intersection logic — §7 |
+| 2 | History depth | **8 years** (~2,016 bars/ticker). Covers the 2018 correction, the 2020 COVID crash and the 2022 bear market — §10.1 |
 | 3 | Label profile | **TP 2.0 / SL 1.0 ATR.** Confirmed. `labels sweep` will still test wider profiles, because §11's cost arithmetic favours them |
 | 4 | Horizon | **10 trading days.** Explained in §9 — it's the timeout barrier |
 | 5 | Can you short? | **Yes**, and via CFDs it's mechanically symmetric with going long (§11.1) |
@@ -1704,27 +1779,33 @@ readable baseline — already enough to iterate on.
 
 ## 16. Still open
 
-1. **How many tickers?** ⚠️ **The most consequential open item.** With 5 years of history,
-   statistical power is `tickers × 126` effective samples (§10.1). Nine tickers gives
-   ~1,100 — **not enough to tell a 40% hit rate from a 45% one**, which is exactly the
-   distinction that decides whether this is profitable (§12). I'd argue for **50–80 liquid
-   US stocks**, spread across sectors rather than concentrated in tech. It's the one change
-   that buys power *and* attacks survivorship bias (§10.5 #7) at the same time.
-2. **Which tickers?** The universe must be the **intersection of what IQ Option lists and
-   what yfinance covers** — no point modeling a stock you can't trade there. Can you export
-   or screenshot IQ Option's US stock list? That becomes `config/universe.txt`. Failing
-   that, we start from the S&P 100 and you prune what's unavailable.
-3. **Risk per trade.** Default is 1% of equity, max 5 concurrent, margin ceiling 50%
+1. **How many tickers?** ⚠️ **Still the most consequential open item**, and the only one
+   left that changes whether the results are interpretable. 8 years gives
+   `tickers × 200` effective samples (§10.1):
+
+   | Tickers | Effective samples | 12-month holdout | Verdict quality |
+   |---|---|---|---|
+   | 9 | ~1,800 | ~225 | ⚠️ too thin for a confident go/no-go |
+   | 30 | ~6,000 | ~750 | workable |
+   | 60 | ~12,000 | ~1,500 | good |
+
+   **Recommendation: 30 minimum, 50–60 preferred, spread across sectors** rather than
+   concentrated in tech. Nine mega-cap tech names are also highly correlated with each
+   other, so 9 tickers delivers appreciably less than 9× the information of one. More
+   tickers is the only knob that buys statistical power *and* attacks survivorship bias
+   (§10.5 #7) at once — and since you're supplying the list, it costs you nothing but
+   typing.
+2. **Risk per trade.** Default is 1% of equity, max 5 concurrent, margin ceiling 50%
    (§11). At 10× leverage, 1% risk uses only ~5% of equity as margin per position, so
    you could comfortably run 10–15 concurrent positions — which **lowers** variance
    through diversification. Want to raise `max_concurrent`?
-4. **Earnings — final call.** Design ships OHLCV-only per your preference (§8.2.1). My
+3. **Earnings — final call.** Design ships OHLCV-only per your preference (§8.2.1). My
    one reservation, stated and then dropped: at 10× leverage a 10% earnings gap wipes a
    position's full margin (§11.1), and it's the only tail risk here that's knowable in
    advance. The proxy covers most of it. Your call, and it's reversible later.
-5. **Your actual IQ Option costs.** The §11 defaults (0.10% round-trip spread, 0.02%/day
+4. **Your actual IQ Option costs.** The §11 defaults (0.10% round-trip spread, 0.02%/day
    financing) are industry-typical guesses, not their published numbers — I couldn't read
    their site. **Since costs move break-even from 33% to ~42%, these are load-bearing.**
    If you can read your spread and overnight fee off the platform for one or two stocks,
    that's the single highest-value number you can give me.
-6. **Starting equity** for backtest sizing. Default $10,000.
+5. **Starting equity** for backtest sizing. Default $10,000.

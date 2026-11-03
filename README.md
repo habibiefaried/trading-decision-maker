@@ -45,8 +45,9 @@ AMD    HOLD    conf 0.48   — no edge: ADX 14 (chop), earnings in 3 days
 ### Data
 
 ```bash
+./venv/bin/python -m tdm.cli universe validate # check tickers before downloading
 make fetch                                    # incremental; skips what's already cached
-./venv/bin/python -m tdm.cli fetch --symbols NVDA,AMD --since 2015-01-01
+./venv/bin/python -m tdm.cli fetch --symbols NVDA,AMD --since 2018-11-01
 ./venv/bin/python -m tdm.cli fetch --dry-run  # print the fetch plan, make no HTTP calls
 ./venv/bin/python -m tdm.cli fetch --force --symbols NVDA   # ignore cache, re-pull
 ./venv/bin/python -m tdm.cli db status        # coverage, gaps, staleness per symbol
@@ -93,7 +94,7 @@ make decide
 
 | File | Purpose |
 |---|---|
-| `config/universe.txt` | tickers, one per line |
+| `config/universe.txt` | **your** tickers, one per line. Benchmarks (SPY etc.) are added automatically |
 | `config/config.toml` | horizon, ATR multiples, costs, thresholds, position sizing |
 | `config/feature_sets/*.toml` | which indicators to compute |
 
