@@ -1112,16 +1112,196 @@ trains fine and scores fine in-sample.
 
 ---
 
-## 9. Label generation: a race between three exit conditions
+## 9. The training table and label generation
 
-This is where the vague question "should I trade?" becomes a concrete supervised learning
-problem. The method is the **triple-barrier method** (from López de Prado, *Advances in
-Financial Machine Learning*).
+### 9.0 What the table actually looks like
 
-### The idea
+You asked what columns get added once OHLCV + indicators exist. Here is the whole schema.
+One row per `(symbol, date)`, written to Parquet and exportable to CSV.
 
-Rather than predicting a price (hard, and not what you need), simulate the trade and ask
-**which exit fires first**. It's a race between three conditions — close to a `select` over
+```
+┌─ IDENTITY ────────────────────────────── never features ─┐
+  symbol                  str        "NVDA"
+  date                    date       2026-11-03
+
+┌─ RAW ───────── kept for charting (§7) and labeling; NOT features ─┐
+  open high low close volume
+
+┌─ FEATURES (X) ──────── the allowlist from registry.feature_names() ─┐
+  close_vs_ema21          float      -0.012
+  adx_14                  float      31.4
+  rsi_14                  float      58.2
+  rs_rank                 float      0.94
+  atr_14                  float      3.81      ← used by labeler, also a feature as atr_pct
+  ... 41 CORE columns (§8.0), ~115 with EXTENDED
+
+┌─ TARGETS (y) ───────────────── one set per direction, from §9.1 ─┐
+  y_long                  int8       1 = TP hit before SL, 0 = not
+  y_short                 int8
+  y_long_t1               date       ⚠️ when the label RESOLVED — §10.3 needs this
+  y_short_t1              date
+  y_long_reason           str        tp | sl | timeout | ambiguous
+  y_short_reason          str
+  y_long_ret              float      realized return, NET of costs (§11)
+  y_short_ret             float
+  y_long_hold_days        int8
+  y_short_hold_days       int8
+  y_long_weight           float      label-uniqueness weight (§9.1)
+  y_short_weight          float
+
+┌─ FORWARD RETURNS ─────── diagnostics + optional alternative target ─┐
+  fwd_ret_1d              float      close[t+1]/close[t] − 1
+  fwd_ret_2d              float
+  fwd_ret_5d              float
+  fwd_ret_10d             float
+  fwd_mfe_10d             float      max FAVOURABLE excursion ÷ ATR  ← see below
+  fwd_mae_10d             float      max ADVERSE excursion ÷ ATR     ← see below
+
+┌─ META ─────────────────────────────────── bookkeeping, never features ─┐
+  meta_tradeable          bool       False for SPY and sector ETFs (§6)
+  meta_gate_pass          bool       passed the §13 hard gates (§10.1 sample filter)
+  meta_run_id             str        provenance (§5)
+```
+
+### Yes, add forward-looking columns — with two corrections
+
+Your instinct is right: the table needs columns computed from the future, or there is
+nothing to learn from. Two things to get right about *which* future, though.
+
+> #### ⚠️ Correction 1: predict the **return**, never the **price**
+>
+> This is the single most common way a financial ML project fools itself, and it's worth
+> being blunt about because the failure looks like spectacular success.
+>
+> If you add `next_day_close` as the target and regress on it, you will get **R² ≈ 0.999**.
+> You will think you have built something extraordinary. You have built this:
+>
+> ```
+> close[t+1] ≈ close[t]
+> ```
+>
+> Tomorrow's price is almost entirely explained by today's price. The model learns the
+> identity function, scores brilliantly on every regression metric, and contains **zero**
+> tradeable information. Worse, it's hard to notice: the predictions look right, the
+> scatter plot looks like a perfect diagonal, and the errors are tiny.
+>
+> So the target must always be a **change**: `close[t+1]/close[t] − 1`. Do that and R²
+> drops to roughly **0.00–0.01**, which is disappointing and *true*. Next-day returns are
+> ~95% noise. The honest number is the useful one.
+>
+> **Hard rule: no absolute price level is ever a target or a feature.** This is the same
+> scale-free rule as §8.5, applied to the `y` side of the table.
+
+> #### ⚠️ Correction 2: next-day return doesn't answer your question
+>
+> Suppose you predict `fwd_ret_10d = +4%` perfectly. Should you take the trade, and where
+> does the stop go?
+>
+> You can't tell — because **the endpoint doesn't describe the path.** Consider two stocks
+> that both finish +4% after 10 days:
+>
+> ```
+> A:  +1% +1% +1% +1% ... steady            → your 1-ATR stop never triggers.  WIN
+> B:  −9% −3% +2% ... recovers to +4%       → your stop triggered on day 1.    LOSS
+> ```
+>
+> **Identical target value, opposite trade outcomes.** A forward-return model cannot
+> distinguish them, which means it cannot tell you whether TP gets hit before SL — and
+> "take profit before I cut loss" was the original question (§1).
+>
+> That's what the triple barrier in §9.1 is for: it simulates the *path* and reports which
+> exit fired first. `y_long` already encodes "profit before loss" directly, so no
+> post-processing is needed to turn a number into a decision.
+
+### So why keep `fwd_*` columns at all?
+
+Three genuinely useful jobs, none of them "be the primary target":
+
+**1. Sanity check on whether any signal exists.** Correlate each feature against
+`fwd_ret_5d` and `fwd_ret_10d`. If *nothing* in ~115 features correlates with *any*
+forward horizon, stop and reconsider the features — don't go train a model on it. This is
+a five-minute check that can save weeks, and it goes in `reports/feature_dist.html`.
+
+**2. `fwd_mfe_10d` and `fwd_mae_10d` tell you if your TP/SL multiples are sane.** These
+are the maximum favourable and adverse excursions over the horizon, in ATR units — i.e.
+*how far did price actually travel in each direction before the window closed.* They make
+the barrier choice empirical instead of guessed:
+
+| Observation | What it means | Action |
+|---|---|---|
+| `fwd_mfe_10d` rarely reaches 2.0 | your TP is further than price usually travels | lower `k_tp`, or raise `H` |
+| `fwd_mae_10d` usually exceeds 1.0 | your SL sits inside normal noise — you'll be stopped out constantly | raise `k_sl` |
+| both frequently exceeded | barriers are too tight for daily bars | widen both; expect many `ambiguous` labels (§9.1) |
+
+Feed these into `tdm labels sweep` (§9.1). They turn "TP 2.0 / SL 1.0" from a reasonable
+guess into a measured choice.
+
+**3. An alternative target you can actually test.** The design's claim that
+classification-on-barriers beats regression-on-returns is an argument, not a proof. So
+training supports both and you can compare on the same folds:
+
+```bash
+tdm train --target barrier          # default: y_long / y_short (§9.1)
+tdm train --target fwd_ret_10d      # regression on net 10-day return
+tdm train --target fwd_ret_sign     # classification on direction only
+```
+
+If forward-return regression wins on *expectancy after costs* (§10.4 — not on R², which
+is the wrong metric), use it. The infrastructure cost is one flag.
+
+> #### ⚠️ The leakage bug this table invites, and how the design prevents it
+>
+> Features and targets now live in **the same table**. That is convenient, and it is one
+> line away from catastrophe:
+>
+> ```python
+> X = df.drop(columns=["y_long"])        # ← LEAK. fwd_ret_10d is still in X.
+> ```
+>
+> You just handed the model the answer. It will score ~99% accuracy, the metrics will look
+> incredible, and the backtest will look like a money printer. There is no error message.
+> This is §10.5's central bug class arriving through a one-word mistake.
+>
+> **Two mechanisms, both required:**
+>
+> 1. **Column naming is load-bearing.** Every non-feature column carries a mandatory
+>    prefix: `y_` (targets), `fwd_` (forward-looking), `meta_` (bookkeeping). A bare name
+>    is a feature. This makes a leak *visible* when reading code.
+> 2. **Feature selection is an allowlist, never a denylist:**
+>
+>    ```python
+>    X = df[registry.feature_names()]       # ✅ allowlist — explicit, from §8.0
+>    X = df.drop(columns=TARGETS)           # ❌ denylist — silently leaks any new column
+>    ```
+>
+>    With an allowlist, adding `fwd_ret_20d` tomorrow is inert: it isn't registered, so it
+>    can't reach the model. With a denylist, the same addition silently poisons every
+>    model you train afterwards.
+>
+> `tests/test_leakage.py` asserts that no column matching `^(y_|fwd_|meta_)` ever appears
+> in `X`, and that `set(X.columns) == set(registry.feature_names())` exactly.
+
+### Export
+
+```bash
+tdm dataset build --set core           # -> data/datasets/<run_id>.parquet
+tdm dataset export --format csv        # -> data/exports/<run_id>.csv   (one flat table)
+tdm dataset schema                     # print the column list with dtypes and tiers
+```
+
+The CSV export is the table above, flat, one row per `(symbol, date)` — readable in Excel,
+and exactly what the model consumes.
+
+---
+
+### 9.1 Labeling: the triple barrier
+
+The method is the **triple-barrier method** (López de Prado, *Advances in Financial
+Machine Learning*), and it's what turns "should I trade?" into a supervised learning
+problem that matches the question.
+
+Rather than predicting a price (hard, and — per §9.0 — not what you need), simulate the
+trade and ask **which exit fires first**. It's a race between three conditions — close to a `select` over
 three channels, or `asyncio.wait(..., FIRST_COMPLETED)`:
 
 ```
@@ -1259,7 +1439,7 @@ Standard CV treats them as if they were, which inflates every metric. Two correc
 **effective independent sample count is more like 2,000–4,000.** That number, not the row
 count, is what should govern model complexity.
 
-### Configuration and the parameter sweep
+### 9.2 Configuration and the parameter sweep
 
 `k_tp`, `k_sl`, `horizon` and the ATR period form a named *label profile* in
 `config.toml`, hashed into `label_run.run_id`. So two settings are two reproducible,
@@ -1272,6 +1452,8 @@ tdm labels sweep     # grid over profiles. Per profile, report:
                      #   margin above break-even   <- the number that matters
                      #   mean holding period, timeout fraction, ambiguity rate
                      #   effective sample count (after uniqueness weighting)
+                     #   median fwd_mfe / fwd_mae in ATR  (§9.0) — are the
+                     #     barriers placed where price actually travels?
 ```
 
 **Run this before training.** It answers, in five minutes rather than after a day of model

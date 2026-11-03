@@ -67,7 +67,14 @@ make features                                 # -> data/features/<run_id>.parque
 
 make label                                    # triple-barrier labels
 ./venv/bin/python -m tdm.cli labels sweep      # compare TP/SL/horizon profiles
+
+./venv/bin/python -m tdm.cli dataset build     # features + targets, one flat table
+./venv/bin/python -m tdm.cli dataset export --format csv   # -> data/exports/
+./venv/bin/python -m tdm.cli dataset schema    # column list, dtypes, CORE/EXT tier
 ```
+
+The dataset is one row per `(symbol, date)`: identity, raw OHLCV, ~41 feature columns,
+`y_*` target columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §9.0.
 
 ### Charts
 

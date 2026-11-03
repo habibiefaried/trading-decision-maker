@@ -102,15 +102,25 @@ Each of these has burned this class of project before. DESIGN.md explains why.
     across tickers, and features become invariant to splits — which is what makes
     re-downloading safe. `tests/test_invariance.py` enforces it by injecting a synthetic
     split and asserting past feature values are unchanged. (§8.5, §5)
-14. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
+13. **Feature selection is an ALLOWLIST, never a denylist.** Targets and features live
+    in the same table (§9.0), so `X = df.drop(columns=["y_long"])` silently leaves
+    `fwd_ret_10d` in `X` and hands the model the answer — ~99% accuracy, no error, and a
+    backtest that looks like a money printer. Always `X = df[registry.feature_names()]`.
+    Non-feature columns carry a mandatory prefix: `y_`, `fwd_`, `meta_`. A bare column
+    name means it is a feature. (§9.0)
+14. **Never target an absolute price.** Predicting `close[t+1]` gives R²≈0.999 by learning
+    `close[t+1]≈close[t]` — the identity function, zero tradeable information, and it
+    looks like a triumph. Targets are always changes: returns, or barrier outcomes.
+    (§9.0)
+15. **Filter training samples through the same gates `decide` uses.** `max_vol`,
+    `min_liquidity` and the gap filter run at sample-construction time too — otherwise
+    you train on regimes you will never trade in (e.g. March 2020 at 10x leverage).
+    (§10.1)
+16. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
     beats CatBoost on the holdout, CatBoost is overfit — report both, always. Keep the
     depth-4 tree permanently as the readable baseline. Shallow and heavily regularized:
     `depth=4`, `learning_rate=0.03`, `l2_leaf_reg≈10`, `od_type="Iter"` early stopping.
     Leave `boosting_type="Ordered"` on — it is the reason we chose CatBoost. (§10.1)
-13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
-    `min_liquidity` and the gap filter run at sample-construction time too — otherwise
-    you train on regimes you will never trade in (e.g. March 2020 at 10x leverage).
-    (§10.1)
 
 ## 3a. Chart before you train
 
