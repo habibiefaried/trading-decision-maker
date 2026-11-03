@@ -51,9 +51,9 @@ re-run with `./venv/bin/python`.
 `DESIGN.md` is the source of truth for architecture and, more importantly, for the
 *reasoning*, and it assumes no finance background — **§2 is a glossary** defining every
 domain term in software terms. Organized by section (§5 schema, §6 price adjustment,
-§7 incremental fetch, §8 indicators, §9 labeling, §10 validation, §13 decision rule).
-When you change behaviour, update the
-relevant section in the same commit.
+§7 incremental fetch, §8 indicators, §9 labeling, §10 validation, §11 backtest + venue
++ costs, §13 decision rule, §15 resolved decisions, §16 still open). When you change
+behaviour, update the relevant section in the same commit.
 
 `README.md` is for script/command usage only — no design discussion there.
 
@@ -68,19 +68,31 @@ Each of these has burned this class of project before. DESIGN.md explains why.
    consults `fetch_coverage` and `known_gap`. Fetching twice is the bug this repo
    exists to avoid. (§7)
 3. **No lookahead, ever.** A feature on date *d* may only use bars up to and including
-   *d*. In particular: ZigZag pivots must respect `confirmed_at`; weekly features must
-   use the last *completed* weekly bar; z-scores and percentile ranks use trailing
-   windows only (never `fit()` on the full series). (§8.5, §10.5)
+   *d*. In particular: ZigZag pivots must respect `confirmed_at`; z-scores and percentile
+   ranks use trailing windows only (never `fit()` on the full series). (§8.5, §10.5)
 4. **Never use plain `KFold` / `train_test_split`.** Use
    `model/cv.py::PurgedWalkForwardSplit`. Labels span up to H future bars, so ordinary
    CV leaks test prices into training labels and every metric comes out inflated. (§10.3)
-5. **Don't touch the holdout window.** The final ~18 months require an explicit
+5. **Don't touch the holdout window.** The final 12 months require an explicit
    `--unlock-holdout` flag. No hyperparameter search, feature selection, or threshold
    tuning against it. (§10.3)
 6. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in
    both the labeler and the backtest. The two must never disagree. (§9, §11)
-7. **Report expectancy, not accuracy.** At 2:1 R:R, break-even is a ~33% hit rate, so
-   accuracy is close to meaningless here. (§10.4)
+7. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
+   costs and **~42% after** CFD spread, slippage and financing. Accuracy is close to
+   meaningless here. (§10.4, §11)
+8. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
+   affects the margin a position ties up, nothing else. Getting this backwards is how
+   leveraged accounts die. (§11.1)
+9. **No ETFs in decisions, but always ingest them.** SPY and sector ETFs are benchmark
+   inputs for relative-strength and regime features. They carry `tradeable = 0` and are
+   filtered at the decision step, never at ingest. (§8.2)
+10. **Don't add Reg SHO / share-borrow / shortability logic.** We trade CFDs, which have
+    no share borrow and no uptick rule. Long and short are one code path with a sign
+    flip. An earlier draft modeled all of this; it was deleted on purpose. (§11.1)
+11. **No weekly resampling.** Dropped by decision. For a longer-timeframe trend signal,
+    use a wider ZigZag threshold on daily bars (`dow_trend_major`), which avoids the
+    partial-bar leakage hazard entirely. (§8.2, §8.4)
 
 ## 4. pandas 3.x gotchas
 

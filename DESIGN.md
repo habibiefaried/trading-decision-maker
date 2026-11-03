@@ -53,14 +53,21 @@ Worth stating up front, because they drive most of the design decisions:
 
 ### Scope (locked in with the user)
 
-| Decision | Choice |
-|---|---|
-| What we trade | US stocks & ETFs |
-| Data source | `yfinance` (free Yahoo Finance API wrapper) |
-| Granularity | One row per trading day |
-| How long we hold | 1–10 trading days |
-| Can we bet on prices falling? | **Yes** (confirmed) — so both directions are modeled (§11.1) |
-| Python | 3.15 |
+| Decision | Choice | Notes |
+|---|---|---|
+| **Where we actually trade** | **IQ Option, stock CFDs, 10× leverage** | User has traded there for years. This is a *derivative*, not share ownership — it changes the cost model and removes a regulatory constraint. **§11.1** |
+| What we trade | **US stocks only — no ETFs** | SPY is still *read* as a benchmark for features, but never traded (§8.2) |
+| Universe | intersection of (IQ Option's listed US stocks) ∩ (yfinance coverage) | §16 #1 — IQ Option lists on the order of ~100 US names, not thousands |
+| Data source | `yfinance` (free Yahoo Finance API wrapper) | Prices come from Yahoo; execution happens at IQ Option. These differ — §11.1 |
+| Granularity | One row per trading day | |
+| History depth | **5 years** (~1,260 bars/ticker) | User's call. Has a direct consequence for sample size — §10.1 |
+| Style | **Swing trading** | Hold across days, not intraday, not months |
+| Horizon | **10 trading days max** | This is the timeout barrier — explained in §9 |
+| TP / SL | **2.0 × ATR / 1.0 × ATR** | |
+| Both directions? | **Yes.** CFDs make shorting trivial | §11.1 |
+| Weekly-timeframe features | **Dropped** | User's call; removes a whole class of leakage bug |
+| Earnings-date data | **Optional, default off** | OHLCV-only is the v1 target. ⚠️ But see the leverage warning in §11.1 |
+| Python | 3.15 | |
 
 ---
 
@@ -401,7 +408,10 @@ CREATE TABLE instrument (
     exchange      TEXT,
     currency      TEXT    NOT NULL DEFAULT 'USD',
     asset_type    TEXT    NOT NULL DEFAULT 'equity',   -- equity | etf | index
-    shortable     INTEGER NOT NULL DEFAULT 1,          -- 0 => long-only for this ticker
+    -- Two INDEPENDENT flags. ETFs (SPY, sector ETFs) are tradeable=0 but still
+    -- fetched and read, because features depend on them as benchmarks (§8.2).
+    -- "Don't trade ETFs" must not become "don't download ETFs".
+    tradeable     INTEGER NOT NULL DEFAULT 1,          -- 0 => data-only, never in a decision
     active        INTEGER NOT NULL DEFAULT 1,          -- 0 => delisted; KEEP the rows (§10.5)
     first_bar     TEXT,
     last_bar      TEXT,
@@ -803,7 +813,15 @@ below, because these are data-modelling bugs, not finance opinions.
   the structure you want for a 3-way decision.
 - **ATR(14) and ATR/close.** Needed for TP/SL anyway (§9); as a feature it's your
   volatility-regime variable.
-- **Days-to-next-earnings** and **earnings-within-horizon** (§13 gate).
+- **Gap features** — overnight gap in ATRs, and `days_since_large_gap`. Cheap, OHLCV-only,
+  and they double as the earnings proxy described below.
+
+> **ETFs are read but never traded.** The universe excludes ETFs *as trading candidates*
+> (§1), but SPY and the sector ETFs are still fetched and used as **benchmark inputs** to
+> the features above — relative strength is meaningless without something to be relative
+> *to*. That's what `instrument.tradeable = 0` is for (§5): these rows flow through ingest
+> and features exactly like any other ticker, and are filtered out only at the decision
+> step (§13). Don't let "exclude ETFs" collapse into "don't download SPY."
 
 **Tier 2 — cheap and complementary, given TA-Lib is already a dependency**
 
@@ -812,21 +830,46 @@ Keltner Channels; Donchian / 52-week-high proximity (`close/max(high, 252)`); MF
 (measures *time since* extremes rather than price distance); Supertrend(10, 3×ATR) (binary
 state + distance-to-flip in ATRs — a natural tree feature); Ichimoku; CCI(20);
 Williams %R(14); and simple bar-shape features — `(close−low)/(high−low)`, `range/ATR`,
-overnight gap in ATRs, consecutive up/down days, volume vs its 20-day median.
+consecutive up/down days, volume vs its 20-day median.
 
-**Tier 3 — weekly timeframe**
+**~~Tier 3 — weekly timeframe~~ — dropped.**
 
-Resample daily → weekly (`W-FRI`) and recompute a **small** subset: weekly RSI, weekly
-MACD histogram/ATR, weekly ADX, weekly EMA21 position. Forward-fill onto daily rows.
-
-> ⚠️ **Leakage hazard — and the reason to keep this subset small.** On a Wednesday, the
-> current week's bar **isn't finished yet**. Using it hands the model partial knowledge of
-> the very move it's trying to predict. You must use the last **completed** weekly bar,
-> i.e. shift by one week before forward-filling. §10.5 item 3 asserts this.
+Per the user's decision, no weekly resampling. Worth noting what this buys: the weekly
+path carried a nasty leakage hazard (on a Wednesday the current week's bar isn't finished,
+so using it leaks part of the move you're predicting), and dropping it **removes that
+entire bug class** along with one item from §10.5's checklist. Daily bars with a 1–10 day
+horizon is already swing trading; the weekly features were confirmation, not the signal.
 
 **Explicitly rejected:** TA-Lib's 60+ candlestick pattern recognizers (`CDL*`). Dumping 60
 sparse binary columns into a tree is an invitation to overfit, and the bar-shape features
 above capture the same information continuously in ~3 columns.
+
+### 8.2.1 Earnings: optional, and an OHLCV-only substitute
+
+You asked whether earnings data is really needed, and whether OHLCV alone is enough.
+**Short answer: OHLCV is enough to build the system, so earnings is `optional = false` by
+default** and the `earnings_event` table stays empty until you turn it on. The build does
+not block on it.
+
+The honest caveat, stated once: at 10× leverage an earnings gap is the single most
+dangerous event for an open position (§11.1 — a 10% gap wipes that position's margin
+regardless of your stop). Earnings is also the *one* risk here that is **scheduled and
+knowable in advance**, which makes skipping it the most avoidable of the tail risks.
+
+So, a middle path that respects the OHLCV-only constraint — **derive an earnings proxy
+from price data alone:**
+
+| Feature | From OHLCV only |
+|---|---|
+| `days_since_large_gap` | bars since an overnight gap exceeded ~3 × ATR |
+| `quarterly_cycle_pos` | position in the ~63-trading-day cycle since the last large gap — earnings land on a quarterly cadence, so past gaps predict future ones |
+| `large_gap_due` | `quarterly_cycle_pos` in the window where the next one is statistically likely |
+
+This is a weaker signal than a real calendar — it will mis-date events and confuse
+earnings gaps with news gaps — but it needs no extra data source, no vendor, and no as-of
+bookkeeping (§10.5 #6), and it captures most of the "don't open a new position right now"
+value. **Recommendation:** ship v1 with the proxy, keep the real-calendar gate behind the
+config flag, and turn it on before sizing up.
 
 ### 8.3 Redundancy is a real problem
 
@@ -893,8 +936,17 @@ agreement across timeframes):
 | `dow_trend_age` | bars since `dow_trend` last changed |
 | `swing_hh/hl/lh/ll` | booleans on the most recent completed leg |
 | `dow_volume_confirm` | `+1` if volume expands with the trend and contracts against it, else `−1` |
-| `dow_mtf_agree` | does daily `dow_trend` equal weekly `dow_trend` |
+| `dow_trend_major` | the same `dow_trend` computed from a **wider ZigZag threshold** (8 × ATR instead of 3 × ATR) |
+| `dow_mtf_agree` | does `dow_trend` equal `dow_trend_major` |
 | `dow_sector_confirm` | does the ticker's `dow_trend` equal its sector ETF's |
+
+> **Note on `dow_trend_major` / `dow_mtf_agree`.** Dow Theory's "primary vs secondary
+> trend" idea needs a longer timeframe to compare against. The obvious implementation is
+> weekly bars — but weekly resampling is dropped (§8.2). The cleaner substitute is **two
+> ZigZag thresholds over the same daily series**: a 3 × ATR threshold gives short-term
+> swings, 8 × ATR gives the major ones. Same information, one data path, and **no
+> partial-bar leakage hazard at all** — which makes this strictly better than the weekly
+> version, not just a workaround.
 
 **Elliott Wave features** — deliberately modest: ratios, not wave counts.
 
@@ -972,6 +1024,43 @@ three channels, or `asyncio.wait(..., FIRST_COMPLETED)`:
         t+1                    t+10     ← timeout barrier     → y = sign(return)
 ```
 
+### What "horizon" means
+
+**Horizon (`H`) is the third barrier: the maximum number of trading days you hold before
+giving up and closing at whatever the price happens to be.** `H = 10` means ~2 calendar
+weeks. It's a timeout, in the ordinary programming sense.
+
+So a trade has exactly three possible endings, and the horizon supplies the last one:
+
+| Ending | Condition | Label |
+|---|---|---|
+| Win | TP touched first | `y = 1` |
+| Loss | SL touched first | `y = 0` |
+| **Timeout** | **neither touched within `H` days** | `y = 1` if the net return is positive, else `0` |
+
+**Why have a timeout at all?** Three reasons, in order of importance:
+
+1. **Without it, labels may never resolve.** A position that drifts sideways forever has
+   no outcome, so there's no `y` to train on. The horizon guarantees every sample resolves
+   and bounds how far into the future a label reaches — which is also what makes the
+   purging in §10.3 possible.
+2. **Capital has an opportunity cost.** A position going nowhere for a month is occupying
+   margin and a concurrent-position slot that a better setup could use.
+3. **Financing accrues daily** (§11.1). On a leveraged CFD, a stagnant position isn't
+   neutral — it bleeds a little every day. The timeout caps that bleed.
+
+**Why 10 and not something else?** It should match the TP distance: with TP at 2 × ATR,
+you're asking for roughly two average days' worth of movement *in one direction*. Random
+walks take a lot longer than two days to travel two ATRs, and empirically ~5–15 days is
+the range where a 2-ATR move either happens or the setup has gone stale. 10 is the
+midpoint, and it matches "swing trading" — holding across days, not minutes and not
+months.
+
+It's a tunable config value, not a law. `tdm labels sweep` reports what fraction of
+samples end in timeout for each horizon: **if most of your trades are timing out, `H` is
+too short** (or the TP is too far away); if almost none are, `H` isn't doing any work and
+you're carrying financing cost for nothing.
+
 ### The generator
 
 ```python
@@ -1021,12 +1110,13 @@ logged every run; above ~5% of samples, the barriers are too tight for daily dat
 fill at that same close assumes you traded using information from a price you then got.
 `open[t+1]` is what you can actually do. Costs a little realism, buys a lot of honesty.
 
-**3. Costs go *inside* the label, not bolted on afterward.** `net_return` subtracts
-commission, slippage (modeled as a fraction of ATR — execution noise scales with
-volatility, so fixed basis points would be wrong), and for short positions a daily
-borrowing cost. Because the timeout branch labels on `net_return > 0`, the model learns
-*post-cost* profitability directly rather than learning a gross signal you then have to
-remember to discount.
+**3. Costs go *inside* the label, not bolted on afterward.** `net_return` subtracts the
+CFD spread, slippage (a fraction of ATR — execution noise scales with volatility, so fixed
+basis points would be wrong), and **daily financing on the notional, for both directions**
+(§11.1). Because the timeout branch labels on `net_return > 0`, the model learns *post-cost*
+profitability directly rather than learning a gross signal you then have to remember to
+discount. Given that costs move break-even from 33% to ~42% (§11), having them inside the
+label rather than applied later is what keeps the training target honest.
 
 **4. Two binary models, not one 3-class model.** The design choice most worth scrutinizing.
 The obvious framing is a 3-class label (LONG/SHORT/HOLD). Two problems: with asymmetric
@@ -1063,13 +1153,24 @@ count, is what should govern model complexity.
 comparable experiments rather than an uncommitted edit.
 
 ```bash
-tdm labels sweep     # grid over profiles; report base rate, mean holding
-                     # period, ambiguity rate for each
+tdm labels sweep     # grid over profiles. Per profile, report:
+                     #   base rate            (fraction of positive labels)
+                     #   break-even hit rate  (from the §11 cost model)
+                     #   margin above break-even   <- the number that matters
+                     #   mean holding period, timeout fraction, ambiguity rate
+                     #   effective sample count (after uniqueness weighting)
 ```
 
-**Run this before training.** A profile with a 15% base rate is telling you the setup is
-rare and you'll be learning from very few positive examples — better to know that in five
-minutes than after a day of model tuning.
+**Run this before training.** It answers, in five minutes rather than after a day of model
+tuning, whether a profile is even worth modeling:
+
+- A **15% base rate** means the setup is rare and you'll learn from very few positives.
+- A base rate **below the break-even hit rate** means the profile is unprofitable *even
+  with a perfect model* — no amount of tuning saves it.
+- **Most samples timing out** means `H` is too short, or the TP too far (§9).
+- Since §11's cost arithmetic puts break-even near 42%, this sweep is where you find out
+  whether a wider profile (TP 3 / SL 1.5) amortizes the fixed costs better. Don't assume
+  TP 2 / SL 1 is optimal just because it's the starting point.
 
 ---
 
@@ -1087,10 +1188,40 @@ The user asked for "a simple decision tree (you can suggest as well)". My sugges
 | Alternative | `xgboost` 3.4.1 | Comparable. Worth it for monotonic constraints or GPU; otherwise it's a dependency for marginal gain. Start with HGB. |
 | Variance check | `RandomForest` / `ExtraTrees` | Cheap baseline. If it beats HGB, your HGB is overfit. |
 
-**No neural networks.** Effective sample size is 2,000–4,000 (§9). On tabular data at that
-scale, gradient-boosted trees consistently beat deep nets in published benchmarks. The
-previous project carried a `torch` dependency; drop it. If you later want sequence models,
-that's an argument for *more tickers first*, not a deeper architecture.
+> #### Sample size: the direct consequence of choosing 5 years
+>
+> This governs how complex a model you can justify, so it's worth doing the arithmetic.
+>
+> | | |
+> |---|---|
+> | 5 years × ~252 sessions | **~1,260 bars per ticker** |
+> | ÷ horizon 10 (labels overlap — §9) | **~126 *effective independent* samples per ticker** |
+> | × 9 tickers (the previous universe) | **~1,100 effective samples** |
+> | × 60 tickers | **~7,600 effective samples** |
+>
+> The row count will *look* like 11,000 with 9 tickers. The information content is ~1,100.
+> That's the number that should govern model complexity — and at ~1,100 you can justify a
+> depth-4 tree and little more.
+>
+> **The key relationship: `effective samples ≈ tickers × years × 25`.** Years and tickers
+> are interchangeable for statistical power. Cutting history from 15 years to 5 divides
+> your power by 3, so **holding power constant means roughly tripling the ticker count.**
+>
+> Your reasoning for 5 years — that technical setups recur across market conditions, so
+> the 2020 crash isn't essential — is defensible, and the window has a bonus you may not
+> have counted on: **5 years back from today still includes the 2022 downturn**, so you get
+> a bull market, a bear market, and the current regime. That's real diversity, not a
+> single-regime sample.
+>
+> So the recommendation isn't "use more history" — it's **"use more tickers"** (§16 #1).
+> Same power, and it attacks the survivorship problem (§10.5 #7) at the same time, which
+> adding years does not.
+
+**No neural networks.** Effective sample size is ~1,100–7,600 depending on universe size
+(above). On tabular data at that scale, gradient-boosted trees consistently beat deep nets
+in published benchmarks. The previous project carried a `torch` dependency; drop it. If you
+later want sequence models, that's an argument for *more tickers first*, not a deeper
+architecture.
 
 **One global model across all tickers**, not one per ticker (per-ticker gets ~3,800 rows
 and overfits). **Deliberately exclude ticker identity as a feature** — it invites the model
@@ -1130,11 +1261,24 @@ fold 3:  |=========== train =======| purge | embargo |== test ==|
 - **Embargo** — additionally drop training samples within `E ≈ horizon` bars *before* the
   test start, because serial correlation leaks across the seam even without interval
   overlap.
-- **A true final holdout** — the most recent ~18 months are **never touched**: not for
+- **A true final holdout** — the most recent **12 months** are **never touched**: not for
   hyperparameters, not for threshold tuning, not for feature selection. `tdm train` must
   refuse to read it without an explicit `--unlock-holdout` flag. The flag exists to make
   the peek a deliberate act you'll remember, because each peek spends a little of its
   honesty.
+
+> **Why 12 months and not 18.** With 5 years of history (§10.1) an 18-month holdout is 30%
+> of the dataset, which starves training — and training data is already the scarce
+> resource here. 12 months leaves 4 years for walk-forward CV and still gives a holdout of
+> ~25 effective samples per ticker.
+>
+> ⚠️ **That is thin.** With 9 tickers the holdout holds ~225 effective samples, well under
+> the ~100-trade minimum from §10.4 once the decision threshold filters most bars out —
+> meaning **the final go/no-go verdict would itself be statistically weak.** With 60
+> tickers it's ~1,500 and the verdict means something. This is the same conclusion as
+> §10.1 reached from a different direction, and it's why §16 #1 is the most consequential
+> open question: a wider universe isn't a nice-to-have, it's what makes the evaluation
+> interpretable at all.
 
 ### 10.4 Metrics — accuracy is the wrong objective
 
@@ -1173,10 +1317,10 @@ Every item here is a bug I expect this project to hit at least once. Each gets a
 |---|---|---|
 | 1 | **No feature at date `d` uses any bar after `d`** | Property test: recompute every feature on the series truncated at `d`; assert the value at `d` is identical to the full-series computation. **This single test catches most of the rest.** |
 | 2 | ZigZag pivots respect `confirmed_at` (§8.4) | Highest-risk item |
-| 3 | Weekly features use the last *completed* weekly bar (§8.2) | Assert every weekly feature at `d` is computable from bars strictly before `d`'s Monday |
+| 3 | ~~Weekly features~~ | **N/A — weekly features dropped (§8.2).** One fewer leakage class to defend against |
 | 4 | Scalers / z-scores / percentiles use trailing windows only | Grep-level ban on `.fit(X_all)`; assert window params |
 | 5 | Corporate-action lookahead | Features as-of `d` use only actions with `ts <= d` (the `as_of` param in §6). ⚠️ Strictly, a prospective backtest should use the adjustment factors *known at d*, not today's — this remains a **known bounded approximation**, documented rather than pretended-away |
-| 6 | Earnings dates are as-of | Today's calendar isn't what you knew six months ago. Use `confirmed` + `ingested_at`; treat historical `days_to_earnings` as approximate and **say so** |
+| 6 | Earnings dates are as-of | Only applies if the optional earnings calendar is enabled (§8.2.1). Today's calendar isn't what you knew six months ago — use `confirmed` + `ingested_at`. The OHLCV-only proxy has no such problem, which is a point in its favour |
 | 7 | **Survivorship bias** | ⚠️ **The one item on this list that good code cannot fix.** A universe of today's winners was selected *because* they went up. Partial mitigations: include has-beens (INTC already qualifies), add ETFs, add some losers, and keep delisted tickers with `active = 0` **rather than deleting the rows**. Mostly: know the number is optimistic |
 | 8 | Holdout untouched | `--unlock-holdout` required (§10.3) |
 | 9 | Purging actually applied | Assert no training `[t, t1]` overlaps any test fold |
@@ -1198,14 +1342,16 @@ for d in test_sessions:
 
     orders = decision_rule(p_long, p_short, gates(d))     # SAME function as §13
 
-    # position sizing: risk a fixed fraction of equity per trade
-    shares = (risk_frac * equity) / (cfg.k_sl * atr)
-    # caps: max N concurrent positions, max exposure per sector
+    # position sizing: risk a fixed fraction of equity per trade.
+    # NOTE: leverage does NOT appear here, by design — see §11.1
+    units = (risk_frac * equity) / (cfg.k_sl * atr)
+    margin = units * price / cfg.leverage        # what the position ties up
+    # caps: max N concurrent positions, total margin used, max exposure per sector
 
     fills = fill_at(open_price[d + 1], slippage=s * atr)
     manage_open_positions(d)        # TP / SL / timeout — SAME pessimistic
                                     # same-bar rule as §9. Non-negotiable.
-    accrue_borrow_costs(d)
+    accrue_financing(d)             # daily, on NOTIONAL, both directions (§11.1)
     mark_to_market(d)
 ```
 
@@ -1216,15 +1362,64 @@ for d in test_sessions:
 > up as unexplained live underperformance, which is almost impossible to debug after the
 > fact. Share the code.
 
-**Cost model** (defaults in `config.toml`):
+**Cost model.** Defaults below are **industry-typical retail stock-CFD figures, not
+IQ Option's published numbers** — their site is JavaScript-rendered and I couldn't read
+the actual terms. Treat them as order-of-magnitude starting points and replace them with
+your real values from the platform (§16 #5).
 
-| Item | Default | Note |
-|---|---|---|
-| Commission | $0 + $0.005/share | typical US retail |
-| Slippage | 0.05 × ATR per side | volatility-scaled, not fixed bps |
-| Short borrow cost | 0.3%/yr | accrued daily on open shorts; §11.1 |
-| Short availability | unavailable if `instrument.shortable = 0` | |
-| Short entry blocked by regulation | **skip the entry** | §11.1 — materially changes short results |
+```toml
+[costs]
+spread_pct        = 0.10   # round-trip spread, % of notional. Quoted the way brokers
+                           # quote it; the engine divides by ATR internally.
+                           # Typical retail: 0.05% on the most liquid (AAPL/MSFT),
+                           # 0.1-0.2% mid-cap, wider on thin names.
+slippage_atr_frac = 0.05   # execution noise per side, volatility-scaled
+financing_pct_day = 0.02   # % per DAY on NOTIONAL, both directions.
+                           # Typical: benchmark rate + ~3%/yr markup, /365.
+commission        = 0.0    # normally zero on CFDs — the cost is the spread
+
+[account]
+equity         = 10_000
+leverage       = 10        # sets margin used, NOT position size (§11.1)
+risk_frac      = 0.01      # risk 1% of equity per trade
+max_concurrent = 5
+max_margin_frac = 0.50     # never tie up more than half of equity as margin
+```
+
+> #### ⚠️ Running the arithmetic changes the target
+>
+> Costs are not a rounding error here, and it's worth seeing the number before you build
+> anything. Same example as §11.1 — $10,000 equity, 1% risk, $100 stock, ATR $2, 50 units,
+> $5,000 notional, TP 2 ATR / SL 1 ATR, 10-day hold:
+>
+> | | |
+> |---|---|
+> | Gross win (TP hit) | 2 × $2 × 50 = **+$200** |
+> | Gross loss (SL hit) | 1 × $2 × 50 = **−$100** |
+> | Spread, round trip | 0.10% × $5,000 = −$5 |
+> | Slippage, both sides | 0.1 × ATR × 50 = −$10 |
+> | Financing, 10 days | 0.02%/day × 10 × $5,000 = −$10 |
+> | **Total costs** | **−$25** |
+>
+> Break-even hit rate `p` solves `p × (200 − 25) = (1 − p) × (100 + 25)`:
+>
+> | | Break-even hit rate |
+> |---|---|
+> | Ignoring costs | **33.3%** |
+> | **With costs** | **41.7%** |
+>
+> **Costs move the bar by 8.4 percentage points.** Given that §12 puts a realistically
+> good hit rate at ~45%, costs consume most of the available margin. Three consequences:
+>
+> 1. **§12's expectations are recalibrated against 41.7%, not 33%.** A 40% hit rate is a
+>    *losing* strategy here, not a near-miss.
+> 2. **Spread and slippage are fixed per trade; financing scales with holding time.** So
+>    *wider* barriers amortize the fixed part better — a TP 3 / SL 1.5 profile pays the
+>    same spread to chase a 50% bigger move. This is a real argument for testing wider
+>    profiles, which `tdm labels sweep` (§9) should now report **break-even hit rate per
+>    profile** alongside base rate.
+> 3. **Fewer, better trades beat more trades.** Every additional trade pays the fixed cost
+>    again, which is an independent argument for a high decision threshold in §13.
 
 **Required sensitivity runs.** A single backtest number is not evidence. Report the grid:
 2× slippage, 2× commission, entry delayed one more bar, TP/SL multiples ±25%, horizon ±5
@@ -1235,56 +1430,106 @@ Also run the **shuffled-signal control**: randomly permute the predictions and r
 random does comparably well, the model contributes nothing and your equity curve is just
 measuring the position sizing.
 
-### 11.1 Short-side mechanics
+### 11.1 Execution venue: IQ Option CFDs at 10× leverage
 
-The user confirmed they can short, so `M_short` is in scope. Shorting is **not a sign flip
-on going long** — it has extra costs and, importantly, a regulatory precondition.
+Only the parts that change the code. A **CFD** (contract for difference) is a derivative:
+you don't own shares, you hold a contract that pays the price difference. Three
+consequences for this design.
 
-> #### ⚠️ Reg SHO Rule 201 — a precondition that fails on exactly the orders you want most
->
-> **The rule** (SEC "alternative uptick rule", verified against sec.gov): if a stock falls
-> **10% or more below the previous day's close**, short sales in it are restricted — only
-> permitted at a price **above the current best bid** — for the rest of that day **and all
-> of the next**.
->
-> **Why this specifically breaks this system.** A short signal fires *after* a sharp drop.
-> That is precisely when the restriction is active. So the setups the model most wants to
-> short are **disproportionately the ones a market order cannot fill** — and since we
-> enter at `open[t+1]` (§9), a restricted open means the order simply doesn't execute at
-> the price the backtest assumed.
->
-> Ignore this and the backtest books the best-looking short entries in the dataset while
-> live trading silently skips them. That one discrepancy could account for most of the gap
-> between a good short backtest and a bad short track record. It's a precondition-check
-> bug, and it's invisible unless you model it.
->
-> **Handling, three places:**
-> - **Derive the flag** from stored bars: `ssr_active[t]` is true if
->   `low[t] <= 0.90 * close[t-1]` (triggered today ⇒ restricted today and tomorrow), or if
->   it triggered at `t-1`.
-> - **Hard gate (§13):** if `ssr_active`, don't issue a market short. Report
->   `HOLD — SSR active`, so you can still place a limit order by hand if you want it.
-> - **Backtest:** *skip* the entry rather than filling it at a worse price. Skipping
->   honestly models "my order didn't fill"; a fudged worse fill invents a trade that never
->   happened.
-> - **Feature:** `ssr_active` and `days_since_ssr` go in the matrix — "recently fell 10% in
->   a day" is real information for both directions.
->
-> Derived from daily OHLC, so this **approximates** an intraday trigger (and halts
-> complicate it further). Close enough to matter, not exact. Documented as such.
+**1. Shorting is symmetric, and one whole section of complexity disappears.**
 
-Other asymmetries:
+With real shares, going short means borrowing them, which brings share-availability
+limits, borrow fees, recall risk, and — significantly — **SEC Reg SHO Rule 201**, which
+restricts short sales after a stock drops 10% in a day. An earlier draft of this document
+had a long section on modeling that rule, because it would have fired on exactly the
+setups the model most wants to short.
 
-| Item | Treatment |
-|---|---|
-| **Borrow cost** | Accrued daily inside `net_return` (§9). The 0.3%/yr default is fine for large companies and wildly optimistic for small ones — revisit if the universe expands (§15 #1). |
-| **Hard-to-borrow / recall** | Can't be reconstructed historically without a paid borrow-rate feed. A **known unmodeled optimism**: the backtest assumes every short is borrowable. Mitigate by gating shorts to high-ADV tickers. |
-| **Gap-through-stop tail** | A stop-loss caps your loss only if price passes *through* it. An overnight gap can fill you far past it. §9's pessimistic same-bar rule handles *intrabar* ambiguity; this is a **separate** tail. **Report short-side max single-trade loss separately** from aggregate drawdown, so one outlier can't hide in an average. |
-| **Earnings gate matters more** | An upside earnings surprise is the canonical way a short blows through its stop. |
-| **Margin** | A short consumes more buying power than an equivalent long. Sizing uses the same fixed-fractional risk for both; if margin becomes binding, that's a sizing change, not a model change. |
+**None of it applies to CFDs.** There's no share borrow, so no availability constraint and
+no uptick rule. Deleted:
 
-**Report all §10.4 metrics per direction, never pooled.** Pooling hides the most likely
-outcome — longs carry a modest edge, shorts carry none — behind a mediocre blended number.
+- the `ssr_active` gate and feature
+- the `shortable` availability logic
+- borrow-cost and hard-to-borrow modeling
+
+This is a genuine simplification: short and long become the same code path with a sign
+flip, differing only in the financing rate.
+
+**2. Financing is charged daily on notional, for both directions.**
+
+Unlike owning shares, a leveraged CFD accrues a daily financing charge on the **full
+position value**, not on your margin — and on **long positions too**, not just shorts. At
+10× that charge is 10× larger relative to your own capital than the headline rate
+suggests. Over a 10-day hold it's a real cost, not a rounding error.
+
+So `accrue_financing` runs daily on open positions in both the labeler (§9) and the
+backtest, and the rate is a single config value you fill in from your account.
+
+**3. Position sizing: `risk_frac` sets the size, leverage only sets the margin.**
+
+> #### ⚠️ The one piece of math worth being careful about
+>
+> The intuitive-but-wrong reading of "10× leverage" is *"I can take positions 10× bigger."*
+> That multiplies your risk by 10 and is how leveraged accounts die.
+>
+> The design does the opposite: **size from risk, then check that margin fits.**
+>
+> ```
+> units  = (risk_frac × equity) / (k_sl × ATR)     # leverage absent
+> margin = units × price / leverage                # leverage only here
+> ```
+>
+> Worked example — $10,000 equity, 1% risk, a $100 stock with ATR $2, SL at 1 ATR:
+>
+> | | Value |
+> |---|---|
+> | Risk budget | $100 (1% of equity) |
+> | Loss per unit if SL hits | $2 |
+> | **Units** | **50** |
+> | Position value (notional) | $5,000 |
+> | Margin tied up at 10× | **$500 (5% of equity)** |
+>
+> Your loss if the stop hits is $100 — 1% — **exactly the same as it would be with no
+> leverage at all.** What leverage bought you is that the position consumes $500 of
+> capital instead of $5,000, so you can hold ~10 uncorrelated positions instead of 2.
+>
+> **That's the correct use of leverage here: diversification, not amplification.** More
+> concurrent positions lowers the variance of your results. Sizing 10× bigger instead
+> would raise it tenfold, and a single gap could end the account.
+>
+> Because sizing is risk-based, `leverage` affects only the margin cap. The backtest
+> enforces both `max_concurrent` and a total-margin ceiling so a run can't quietly assume
+> more buying power than you have.
+
+**4. What remains genuinely dangerous: gap risk, amplified 10×.**
+
+A stop-loss only caps your loss if the price passes *through* it. An overnight or weekend
+gap fills you well past it. At 10× leverage this is the one tail that matters:
+
+> **A 10% adverse overnight gap, at 10× leverage, wipes out 100% of the margin on that
+> position** — regardless of where your stop was.
+
+A 10% single-day move in a large US stock is uncommon but entirely routine on earnings
+days. That's the argument for the earnings gate, and it's why I'd keep it even though
+you'd rather skip the earnings data (§16 #4 explains the OHLCV-only compromise).
+
+Handling in the backtest:
+- **Report max single-trade loss per direction**, separately from aggregate drawdown, so
+  one catastrophic gap can't hide inside an average.
+- **Report the margin-wipe count**: how many simulated positions lost ≥100% of their
+  posted margin. If that number is above zero, the sizing or the gates need changing
+  before this goes anywhere near real money.
+- Model weekend gaps explicitly — CFD markets close, and `open[Monday]` vs
+  `close[Friday]` is where they show up.
+
+**Also report all §10.4 metrics per direction, never pooled.** Pooling hides the most
+likely outcome — longs carry a modest edge, shorts carry none — behind a mediocre blended
+number.
+
+> **One mismatch to keep in mind.** Prices come from Yahoo (the real exchange); execution
+> happens at IQ Option, whose quotes are its own and carry a wider spread. Features and
+> labels are built from exchange data, so `spread_pct` is what bridges the two. If your
+> live fills consistently differ from the backtest, that parameter is the first place to
+> look — not the model.
 
 ---
 
@@ -1292,10 +1537,17 @@ outcome — longs carry a modest edge, shorts carry none — behind a mediocre b
 
 Worth calibrating before you see a number, so you can tell success from self-deception.
 
-- At **R:R 2.0**, break-even is a **~33% hit rate** before costs, ~36% after. So **45% is
-  a genuinely good result here**, not a mediocre one. Judge expectancy (§2), not accuracy.
+- At R:R 2.0, break-even is a 33% hit rate *ignoring costs* — but **~42% once CFD spread,
+  slippage and 10 days of financing are included** (the arithmetic is in §11). Judge
+  expectancy (§2), not accuracy.
+- ⚠️ **That 42% is the number that matters, and it's uncomfortably close to the ~45% that
+  counts as a genuinely good result.** The realistic gap between "works" and "doesn't" is
+  only a few percentage points of hit rate. Two implications: the cost parameters need to
+  be *your real ones* (§16 #5), and wider TP/SL profiles deserve a serious look since they
+  amortize the fixed costs better.
 - Out-of-sample precision at threshold around **0.50–0.60** is a solid outcome for
-  daily-bar technical features.
+  daily-bar technical features — and note that comfortably clears the 42% bar, which is
+  where the opportunity is.
 - ⚠️ **If your first run shows >65% out-of-sample accuracy, or a smooth upward equity
   curve, you have a bug — not an edge.** Go back to §10.5. This is the *expected* failure
   mode, not a remote one. The previous project's structure (no purging, no holdout
@@ -1304,13 +1556,19 @@ Worth calibrating before you see a number, so you can tell success from self-dec
   others."** Still useful: a model that reliably says HOLD during choppy periods and sizes
   up in trending ones has value even with an unremarkable hit rate.
 - **Position sizing and risk management will affect your results more than model
-  accuracy.** Fixed-fractional risk, a cap on concurrent positions, and not trading
-  through earnings are worth more than several points of AUC.
-- **Be prepared for the shorts not to work.** US stock indices drift upward over time;
-  short setups have a worse base rate, higher costs, and a worse tail (§11.1). If
-  `M_short` shows no out-of-sample edge, **ship long-only.** That's a finding, not a
-  defeat — and because §11.1 is modeled, it'll be a measured conclusion rather than a
-  guess.
+  accuracy** — and at 10× leverage that's doubly true. Risk-based sizing (§11.1), a cap on
+  concurrent positions, and avoiding earnings gaps are worth more than several points of
+  AUC.
+- **Be prepared for the shorts not to work.** US stock indices drift upward over time, so
+  short setups have a worse base rate. CFDs remove the mechanical obstacles (§11.1) but
+  not that drift. If `M_short` shows no out-of-sample edge, **ship long-only.** That's a
+  finding, not a defeat.
+- **With 5 years of history, expect wide confidence intervals.** ~1,260 bars/ticker, and
+  after label-overlap weighting the effective independent sample count is roughly
+  `tickers × 126` (§10.1). With 9 tickers that's ~1,100 effective samples, which is not
+  enough to distinguish a 40% from a 45% hit rate with any confidence. **This is the
+  strongest argument for a wider universe** (§16 #1) — it's the one knob that buys
+  statistical power without needing more years.
 
 ---
 
@@ -1323,16 +1581,26 @@ def decide(symbol: str, as_of: date) -> Decision:
     x = features.load(symbol, as_of)          # from Parquet, not recomputed
 
     # ── Hard gates. Preconditions the model cannot see. Checked FIRST.
-    if earnings_within(symbol, cfg.horizon):
-        return HOLD("earnings in N days")
+    inst = instrument(symbol)
+    if not inst.tradeable:
+        return SKIP("data-only instrument (ETF/benchmark)")   # §8.2
+    if data_staleness(symbol) > 1:
+        return ABSTAIN("stale data")          # ← fail loud, see below
     if adv_20d(symbol) < cfg.min_liquidity:
         return HOLD("illiquid")
     if atr_pct(symbol) > cfg.max_vol:
         return HOLD("volatility too extreme to size safely")
     if open_positions() >= cfg.max_concurrent:
         return HOLD("position limit")
-    if data_staleness(symbol) > 1:
-        return ABSTAIN("stale data")          # ← fail loud, see below
+    if margin_used_frac() >= cfg.max_margin_frac:
+        return HOLD("margin ceiling reached")                 # §11.1
+
+    # Earnings gate: real calendar if enabled, else the OHLCV-derived
+    # proxy. Matters more at 10x leverage — §11.1, §8.2.1
+    if cfg.earnings.enabled and earnings_within(symbol, cfg.horizon):
+        return HOLD("earnings within horizon")
+    if x["large_gap_due"] and cfg.earnings.use_proxy:
+        return HOLD("gap-risk window (quarterly cycle proxy)")
 
     # ── Model
     p_long  = m_long.predict_proba(x)[1]
@@ -1345,26 +1613,22 @@ def decide(symbol: str, as_of: date) -> Decision:
     else:
         return HOLD(f"no edge: p_long={p_long:.2f} p_short={p_short:.2f}")
 
-    # ── Short-specific preconditions (§11.1)
-    if side is Side.SHORT:
-        if not instrument(symbol).shortable:
-            return HOLD("not shortable")
-        if ssr_active(symbol, as_of):
-            return HOLD("SSR active — needs a limit order above the bid")
-        if adv_20d(symbol) < cfg.min_short_liquidity:
-            return HOLD("borrow risk: ADV too low")
+    # NOTE: no short-specific gates. CFDs have no share borrow and no
+    # uptick rule, so both directions are the same path (§11.1).
 
     # ── Levels: same arithmetic as the labeler, so what you see is
     #    exactly what the model was trained on
     atr   = x["atr_14"]
     entry = last_close(symbol)                     # indicative; real fill is next open
     sign  = +1 if side is Side.LONG else -1
+    units = (cfg.risk_frac * equity) / (cfg.k_sl * atr)   # leverage absent — §11.1
     return Decision(
         side=side, confidence=max(p_long, p_short),
         entry_ref=entry,
         tp=entry + sign * cfg.k_tp * atr,
         sl=entry - sign * cfg.k_sl * atr,
-        shares=int((cfg.risk_frac * equity) / (cfg.k_sl * atr)),
+        units=int(units),
+        margin=units * entry / cfg.leverage,       # what it ties up
         rationale=top_contributing_features(x, n=5),
     )
 ```
@@ -1415,7 +1679,7 @@ Each phase ends somewhere useful, so you can stop or re-scope without a half-bui
 | **7 · Backtest** | engine, costs, sensitivity grid, shuffled control | survives 2× slippage; beats the shuffled control |
 | **8 · Decide** | `tdm decide`, gates, reports, `decision` table | one command, end to end |
 | **9 · Self-scoring** | `tdm score-decisions` | reproduces phase-7 numbers on the overlapping window |
-| **10 · Holdout** | one single evaluation on the untouched 18 months | **go / no-go** |
+| **10 · Holdout** | one single evaluation on the untouched 12 months | **go / no-go** |
 
 Phases 1 and 9 are what make this different from the previous attempt. **If you only reach
 phase 5**, you still have a clean cached dataset, a reproducible feature pipeline, and a
@@ -1423,29 +1687,44 @@ readable baseline — already enough to iterate on.
 
 ---
 
-## 15. Open questions
+## 15. Decisions resolved on 2026-11-03
 
-1. **Universe size.** Keep the previous nine (AMD, AMZN, GOOGL, AAPL, INTC, META, NFLX,
-   NVDA, TSLA)? I'd argue for **50–100 liquid tickers plus sector ETFs.** More independent
-   samples is the cheapest available improvement to statistical power (recall §9: effective
-   sample size is ~2–4k, not 38k), and it directly dilutes the survivorship problem
-   (§10.5 #7). Nine large tech companies are also highly correlated with each other, so the
-   effective sample size is far below 9× one ticker.
-2. **History depth.** 15 years (covers the 2020 crash and the 2022 downturn — valuable
-   diversity of market conditions) or 10 (more similar to now)? I lean 15, with the regime
-   features from §8.2 so the model can condition on it.
-3. **Label profile.** Start at TP 2.0 / SL 1.0 / horizon 10? `tdm labels sweep` (§9) answers
-   this empirically before we commit.
-4. ~~**Can you short?**~~ **Resolved 2026-11-03: yes.** Mechanics in §11.1. Follow-up: do
-   you have **margin + easy-to-borrow access**, and do you know your actual borrow rate?
-   The 0.3%/yr default matters once the universe expands (#1).
-5. **Earnings data source.** `yfinance` earnings dates are unreliable and carry no as-of
-   history (§10.5 #6). Options: accept the approximation, snapshot forward from today so
-   the data becomes trustworthy going forward, or pay a vendor. Given that earnings gaps
-   are the top killer of swing positions, **I'd start snapshotting from day one** — it
-   costs little and compounds.
-6. **Equity and risk-per-trade** for sizing. Defaults: $10,000, 1% risk per trade, max 5
-   concurrent positions.
-7. **Weekly as a separate model?** Current design uses weekly *features* inside the daily
-   model. A dedicated weekly-bar model would get ~1/5 the samples. **Recommend
-   features-only**, as designed.
+| # | Question | Resolution |
+|---|---|---|
+| 1 | Asset class | **US stocks only, no ETFs** as trading candidates. ETFs still ingested as benchmarks with `tradeable = 0` (§8.2) |
+| 2 | History depth | **5 years.** Consequence quantified in §10.1; the window does include the 2022 downturn, so regime diversity is better than it might sound |
+| 3 | Label profile | **TP 2.0 / SL 1.0 ATR.** Confirmed. `labels sweep` will still test wider profiles, because §11's cost arithmetic favours them |
+| 4 | Horizon | **10 trading days.** Explained in §9 — it's the timeout barrier |
+| 5 | Can you short? | **Yes**, and via CFDs it's mechanically symmetric with going long (§11.1) |
+| 6 | Execution venue | **IQ Option stock CFDs, 10× leverage.** Drove the §11.1 rewrite: Reg SHO and share-borrow modeling deleted; financing and margin added |
+| 7 | Earnings data | **Not required.** OHLCV-only, with a derived quarterly-gap proxy (§8.2.1). Real calendar stays behind a config flag |
+| 8 | Weekly features | **Dropped.** Removes a leakage class (§8.2) |
+
+---
+
+## 16. Still open
+
+1. **How many tickers?** ⚠️ **The most consequential open item.** With 5 years of history,
+   statistical power is `tickers × 126` effective samples (§10.1). Nine tickers gives
+   ~1,100 — **not enough to tell a 40% hit rate from a 45% one**, which is exactly the
+   distinction that decides whether this is profitable (§12). I'd argue for **50–80 liquid
+   US stocks**, spread across sectors rather than concentrated in tech. It's the one change
+   that buys power *and* attacks survivorship bias (§10.5 #7) at the same time.
+2. **Which tickers?** The universe must be the **intersection of what IQ Option lists and
+   what yfinance covers** — no point modeling a stock you can't trade there. Can you export
+   or screenshot IQ Option's US stock list? That becomes `config/universe.txt`. Failing
+   that, we start from the S&P 100 and you prune what's unavailable.
+3. **Risk per trade.** Default is 1% of equity, max 5 concurrent, margin ceiling 50%
+   (§11). At 10× leverage, 1% risk uses only ~5% of equity as margin per position, so
+   you could comfortably run 10–15 concurrent positions — which **lowers** variance
+   through diversification. Want to raise `max_concurrent`?
+4. **Earnings — final call.** Design ships OHLCV-only per your preference (§8.2.1). My
+   one reservation, stated and then dropped: at 10× leverage a 10% earnings gap wipes a
+   position's full margin (§11.1), and it's the only tail risk here that's knowable in
+   advance. The proxy covers most of it. Your call, and it's reversible later.
+5. **Your actual IQ Option costs.** The §11 defaults (0.10% round-trip spread, 0.02%/day
+   financing) are industry-typical guesses, not their published numbers — I couldn't read
+   their site. **Since costs move break-even from 33% to ~42%, these are load-bearing.**
+   If you can read your spread and overnight fee off the platform for one or two stocks,
+   that's the single highest-value number you can give me.
+6. **Starting equity** for backtest sizing. Default $10,000.
