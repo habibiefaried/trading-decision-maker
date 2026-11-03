@@ -24,27 +24,28 @@ TSLA   SHORT   conf 0.66   entry 402.10   TP 377.90 (-6.0%)   SL 414.20 (+3.0%) 
 Read that as: *"bet NVDA goes up. Exit with profit at 196.10, or cut the loss at 177.05,
 whichever happens first. Give up after 10 days either way."*
 
-### As a system, it's four stages
+### As a system, it's five stages — a stateless pipeline
 
-| Stage | What it is, in engineering terms | Cost to run | Idempotent? |
+| Stage | What it is, in engineering terms | Cost | Idempotent? |
 |---|---|---|---|
-| **1. Ingest** | Pull rows from a third-party HTTP API that is only intermittently available, into local SQLite | **Expensive** (network, and the service is often down) | Yes — and must *skip* work already done |
-| **2. Features** | `map` a few hundred pure functions over a time series to build a wide numeric matrix | Cheap (seconds) | Yes — pure, fully recomputable |
-| **3. Train** | Generate labels by simulation, then fit a classifier | Minutes | Yes, given a fixed seed |
-| **4. Decide** | Load model, run inference on today's row, write output | Milliseconds | Yes |
+| **1. Fetch** | `yf.download()` 9 years of daily OHLCV for your ticker list | ~1–3 min for 30–60 tickers | Yes — just re-downloads |
+| **2. Features** | `map` ~100 pure functions over each series → one wide numeric matrix | Seconds | Yes — pure |
+| **3. Chart** | Render price + every indicator to interactive HTML so you can *read* it | Seconds | Yes |
+| **4. Train** | Generate labels by simulation, then fit a classifier | Minutes | Yes, with a fixed seed |
+| **5. Decide** | Run inference on today's row, write the output table | Milliseconds | Yes |
 
-The architecture follows from that cost asymmetry: **stage 1 output is precious and gets
-a durable transactional store; stages 2–4 are disposable and get recomputed freely.**
+**There is no database.** The pipeline is a pure function from `(ticker list, date range)` to
+`(charts, model, decisions)`. Every stage re-derives its input. §5 explains why that's
+sound here and what the one real cost is.
 
 ### Three things make this harder than a normal ETL pipeline
 
 Worth stating up front, because they drive most of the design decisions:
 
-1. **The upstream data looks retroactively mutable.** The *adjusted* prices a provider
-   hands you are a function of the present, not a fact about the past — a split rewrites
-   all of them (§6). Store the raw bars instead and the problem dissolves: raw OHLCV for
-   a given date is immutable, and §6.1 shows the derived features are too. It's why the
-   schema looks the way it does.
+1. **The input data is not quite stable between runs.** Re-downloading tomorrow gives you
+   a slightly different dataset: new bars at the tail, and occasionally a rescaled history
+   when a stock splits. §5 shows why this is harmless for the *features* (they're
+   invariant) but matters for *comparing two models*.
 2. **The correctness bug you cannot see.** The whole system predicts the future from the
    past. If any code path accidentally lets future data reach the model, everything still
    runs, all tests pass, metrics look *great*, and the system is worthless. There's no
@@ -62,7 +63,7 @@ Worth stating up front, because they drive most of the design decisions:
 | Universe | **user-supplied ticker list** in `config/universe.txt` | You provide the symbols, the system downloads them. No hardcoded list, no intersection logic — §7 |
 | Data source | `yfinance` (free Yahoo Finance API wrapper) | Prices come from Yahoo; execution happens at IQ Option. These differ — §11.1 |
 | Granularity | One row per trading day | |
-| History depth | **8 years** (~2,016 bars/ticker) | Covers the 2018 correction, the 2020 COVID crash, and the 2022 bear market — §10.1 |
+| History depth | **9 years** (~2,268 bars/ticker) | Reaches back to late 2017. Covers the Feb-2018 volatility spike, the 2020 COVID crash and the 2022 bear market — §10.1 |
 | Style | **Swing trading** | Hold across days, not intraday, not months |
 | Horizon | **10 trading days max** | This is the timeout barrier — explained in §9 |
 | TP / SL | **2.0 × ATR / 1.0 × ATR** | |
@@ -270,17 +271,10 @@ trading-decision-maker/
 │   ├── cli.py                   # single entrypoint, subcommands
 │   ├── config.py                # pydantic-settings + config hashing
 │   │
-│   ├── store/                   # ── persistence layer
-│   │   ├── schema.sql           #    §5
-│   │   ├── migrations/          #    001_init.sql, ... forward-only
-│   │   ├── db.py                #    connection, pragmas, migration runner
-│   │   └── bars.py              #    upsert_bars / read_bars / coverage queries
-│   │
 │   ├── ingest/                  # ── the only module that touches the network
-│   │   ├── provider.py          #    Provider protocol (§7)
-│   │   ├── yahoo.py             #    yfinance implementation
-│   │   ├── sessions.py          #    market-calendar wrapper
-│   │   └── sync.py              #    incremental fetch planner (§7)
+│   │   ├── fetch.py             #    yf.download wrapper + retries (§6)
+│   │   ├── validate.py          #    `universe validate` + OHLCV sanity checks
+│   │   └── sessions.py          #    market-calendar wrapper
 │   │
 │   ├── features/                # ── pure functions, no I/O
 │   │   ├── registry.py          #    name -> fn + declared warmup + deps
@@ -304,8 +298,14 @@ trading-decision-maker/
 │   │   └── registry.py          #    artifacts + provenance
 │   │
 │   ├── backtest/
-│   │   └── engine.py            #    §12
+│   │   └── engine.py            #    §11
 │   │
+│   ├── report/                  # ── §7 — visual verification
+│   │   ├── charts.py            #    Plotly multi-panel price + indicators
+│   │   ├── overlays.py          #    label brackets, decision markers, pivots
+│   │   └── diagnostics.py       #    correlation heatmap, feature distributions
+│   │
+│   ├── provenance.py            #    append to runs.jsonl (replaces the *_run tables)
 │   └── decide.py                #    §13 — production inference path
 │
 ├── scripts/bootstrap.sh
@@ -317,18 +317,19 @@ trading-decision-maker/
 │   └── test_incremental_fetch.py
 │
 ├── data/                        # GITIGNORED
-│   ├── market.db                #   SQLite: bars, actions, metadata, provenance
-│   ├── features/                #   Parquet
+│   ├── raw/                     #   optional OHLCV snapshot, for offline work
+│   ├── features/                #   Parquet — the snapshot that matters (§5)
 │   ├── labels/                  #   Parquet
 │   └── exports/                 #   CSV, for eyeballing in Excel
 ├── models/                      # GITIGNORED
-└── reports/                     # GITIGNORED
+├── reports/                     # GITIGNORED — charts/, equity.html, decisions
+└── runs.jsonl                   # GITIGNORED — append-only provenance log
 ```
 
 ### Layering rule
 
 ```
-cli  ->  decide / train / backtest  ->  features / labels  ->  store  ->  ingest
+cli  ->  decide / train / backtest / report  ->  features / labels  ->  ingest
 ```
 
 Dependencies point one way only. Two consequences worth enforcing in review:
@@ -336,8 +337,10 @@ Dependencies point one way only. Two consequences worth enforcing in review:
 - **`features/` and `labels/` do no I/O and import nothing from `ingest/`.** They're pure
   functions over DataFrames. That's what makes them unit-testable without a network or a
   database, which in turn is what makes §10.5's leakage tests possible.
-- **`ingest/` is the only module that makes HTTP calls.** All network flakiness,
-  retries, and availability handling is contained there.
+- **`ingest/` is the only module that makes HTTP calls.** All retries and validation of
+  provider output are contained there. Everything downstream sees clean DataFrames.
+- **`report/` reads the feature matrix; it never computes indicators.** §7 explains why
+  a chart that draws its own indicators is worse than no chart.
 
 ### What went wrong in the previous attempt
 
@@ -354,564 +357,275 @@ this layout exists to fix:
 
 ---
 
-## 5. Storage layer
+## 5. No database — and why that's sound here
 
-### What goes where, and why
+The original plan had SQLite with a schema, migrations, coverage tracking, and gap
+bookkeeping, so that a bar was never downloaded twice. **That's deleted.** yfinance is
+reliable enough and fast enough that re-downloading is cheaper than the machinery needed
+to avoid it. This section records what that buys, what it costs, and the one mitigation
+worth keeping.
 
-| Data | Store | Reason |
+### What gets deleted
+
+| Removed | Why it existed | Why it's unnecessary now |
 |---|---|---|
-| Raw daily bars | **SQLite** | Expensive to re-acquire — the upstream is only intermittently available (§7.1). Needs transactions and durability. |
-| Corporate actions | **SQLite** | Small, critical, same reason |
-| Provenance / run metadata | **SQLite** | Relational, queried ad hoc |
-| Issued decisions + outcomes | **SQLite** | Append-only audit log |
-| Feature matrix | **Parquet** | Wide, numeric, and **append-only — a row once written is correct forever** (§6.1). See the trade-off table below. |
-| Labels | **Parquet** | Same |
-| Exports for Excel | **CSV** | On demand only |
+| `bar_daily`, `corporate_action` tables | durable cache of expensive fetches | fetch is cheap and reliable |
+| `fetch_coverage`, `known_gap` | work out which dates are missing, never re-request | we always request everything |
+| the sync planner (range coalescing, gap healing, restatement lookback) | incremental fetching | no increments — it's a full refresh |
+| migrations, `STRICT` schema, WAL pragmas | schema evolution | no schema |
+| **raw-price storage + adjust-on-read** | a cached *adjusted* price goes stale when a split rewrites history | ⬇ see below — this one is the interesting deletion |
 
-The user asked for "CSV or SQLite" for features. Having looked at the access pattern,
-here's the honest comparison:
+### The adjustment problem deletes itself
 
-| Option | Shape | Read speed | Schema churn | Verdict |
-|---|---|---|---|---|
-| SQLite **wide** (1 column per feature) | 120+ columns | fast | `ALTER TABLE` for every new indicator | ✗ |
-| SQLite **long** (`symbol, ts, name, value`) | 3 cols, ~5× the rows | needs a pivot on read | none | ○ available as export |
-| **Parquet** | wide, columnar, typed | fastest; column pruning | none | ✓ **default** |
-| CSV | wide, untyped | slow; loses dtypes and NaN fidelity | none | ○ available as export |
+The most intricate part of the old design existed purely *because* we cached. Recall the
+failure it prevented: adjusted prices are a function of all corporate actions *since*, so
+a split silently rewrites them — and rows written before the split end up on a different
+scale from rows written after, in the same table, with no error raised.
 
-**Reasoning:** features are *cheap and disposable* — a full rebuild over 10 tickers × 15
-years is seconds of TA-Lib work. What's expensive is the network fetch. So the store that
-needs to be durable and transactional is `bar_daily`, which is exactly SQLite's job. The
-feature matrix is a wide block of float64 read whole into pandas — Parquet's sweet spot —
-and it stays schema-free, so adding your 40th indicator is a one-line registry entry
-rather than a migration. Both other formats remain available:
-
-```bash
-tdm features export --format csv    --out data/exports/
-tdm features export --format sqlite --table feature_long
-```
-
-### Schema conventions
-
-- **`STRICT` tables** throughout. SQLite's default type affinity will cheerfully store the
-  string `"NaN"` in a `REAL` column, and you'd find out during training. `STRICT` needs
-  SQLite 3.37+; Python 3.15 bundles 3.51. Use it.
-- **Dates are ISO-8601 `TEXT`** (`'2026-11-03'`). Sidesteps the pandas 3 datetime
-  resolution change, sorts lexicographically, readable in a SQL console.
-- **Raw prices only.** See §6 — this is the schema decision that matters most.
-
-```sql
-PRAGMA journal_mode = WAL;        -- read while a fetch writes
-PRAGMA synchronous  = NORMAL;
-PRAGMA foreign_keys = ON;
-
--- ── Instruments ──────────────────────────────────────────────────────────────
-CREATE TABLE instrument (
-    symbol        TEXT PRIMARY KEY,
-    name          TEXT,
-    exchange      TEXT,
-    currency      TEXT    NOT NULL DEFAULT 'USD',
-    asset_type    TEXT    NOT NULL DEFAULT 'equity',   -- equity | etf | index
-    -- Two INDEPENDENT flags. ETFs (SPY, sector ETFs) are tradeable=0 but still
-    -- fetched and read, because features depend on them as benchmarks (§8.2).
-    -- "Don't trade ETFs" must not become "don't download ETFs".
-    tradeable     INTEGER NOT NULL DEFAULT 1,          -- 0 => data-only, never in a decision
-    active        INTEGER NOT NULL DEFAULT 1,          -- 0 => delisted; KEEP the rows (§10.5)
-    first_bar     TEXT,
-    last_bar      TEXT,
-    meta_json     TEXT,                                -- raw provider payload
-    updated_at    TEXT    NOT NULL
-) STRICT;
-
--- ── Raw daily bars: the cache that matters ───────────────────────────────────
-CREATE TABLE bar_daily (
-    symbol        TEXT    NOT NULL REFERENCES instrument(symbol),
-    ts            TEXT    NOT NULL,         -- session date, exchange-local
-    open          REAL    NOT NULL,
-    high          REAL    NOT NULL,
-    low           REAL    NOT NULL,
-    close         REAL    NOT NULL,         -- UNADJUSTED (§6)
-    volume        INTEGER NOT NULL,
-    source        TEXT    NOT NULL,         -- 'yahoo'
-    ingested_at   TEXT    NOT NULL,
-    revision      INTEGER NOT NULL DEFAULT 1,  -- bumped if the provider restates the bar
-    PRIMARY KEY (symbol, ts)
-) STRICT, WITHOUT ROWID;
-
-CREATE INDEX idx_bar_daily_ts ON bar_daily(ts);
-
--- ── Corporate actions: why we don't store adjusted prices ────────────────────
-CREATE TABLE corporate_action (
-    symbol        TEXT NOT NULL REFERENCES instrument(symbol),
-    ts            TEXT NOT NULL,
-    kind          TEXT NOT NULL,            -- 'dividend' | 'split' | 'capital_gain'
-    value         REAL NOT NULL,            -- cash amount, or split ratio (10.0 = 10:1)
-    ingested_at   TEXT NOT NULL,
-    PRIMARY KEY (symbol, ts, kind)
-) STRICT;
-
--- ── Fetch bookkeeping: "don't download it twice" lives here ───────────────────
-CREATE TABLE fetch_coverage (
-    symbol        TEXT NOT NULL,
-    interval      TEXT NOT NULL,            -- '1d'
-    source        TEXT NOT NULL,
-    start_ts      TEXT NOT NULL,            -- earliest session held
-    end_ts        TEXT NOT NULL,            -- latest session held
-    bar_count     INTEGER NOT NULL,
-    last_fetch_at TEXT NOT NULL,
-    PRIMARY KEY (symbol, interval, source)
-) STRICT;
-
--- Sessions the calendar says exist but the provider has no data for.
--- Without this table, every run re-requests the same permanent holes forever.
---
--- `confirmations` exists because yfinance is INTERMITTENTLY AVAILABLE (§7.1):
--- a flaky empty response is indistinguishable from a genuine hole, and
--- recording one as permanent would silently truncate your history forever.
--- A gap is only trusted as permanent once corroborated.
-CREATE TABLE known_gap (
-    symbol        TEXT    NOT NULL,
-    ts            TEXT    NOT NULL,
-    reason        TEXT    NOT NULL,         -- 'no_data' | 'halted' | 'pre_ipo'
-    confirmations INTEGER NOT NULL DEFAULT 1,
-    corroborated  INTEGER NOT NULL DEFAULT 0,  -- 1 = a fetch returned OTHER dates
-                                               --     in the same range but not this one
-    first_seen    TEXT    NOT NULL,
-    checked_at    TEXT    NOT NULL,
-    PRIMARY KEY (symbol, ts)
-) STRICT;
-
-CREATE TABLE fetch_log (
-    id            INTEGER PRIMARY KEY,
-    symbol        TEXT, interval TEXT, source TEXT,
-    req_start     TEXT, req_end TEXT,
-    status        TEXT NOT NULL,            -- 'ok' | 'partial' | 'empty'
-                                            -- | 'unavailable' | 'error'
-    rows_written  INTEGER,
-    attempts      INTEGER NOT NULL DEFAULT 1,
-    error         TEXT,
-    duration_ms   INTEGER,
-    at            TEXT NOT NULL
-) STRICT;
-
--- ── Scheduled events we must not trade through (§13) ─────────────────────────
-CREATE TABLE earnings_event (
-    symbol        TEXT NOT NULL REFERENCES instrument(symbol),
-    ts            TEXT NOT NULL,
-    session       TEXT,                     -- 'bmo' (before open) | 'amc' (after close)
-    confirmed     INTEGER NOT NULL DEFAULT 0,
-    ingested_at   TEXT NOT NULL,            -- when WE learned it (§10.5 item 6)
-    PRIMARY KEY (symbol, ts)
-) STRICT;
-
--- ── Provenance: which code + config produced which artifact ──────────────────
--- Content-addressed: run_id = hash(config, code_version, date_range, symbols).
--- This is what the previous project lacked.
-CREATE TABLE feature_run (
-    run_id        TEXT PRIMARY KEY,
-    feature_set   TEXT NOT NULL,
-    config_json   TEXT NOT NULL,
-    code_version  TEXT NOT NULL,            -- git describe --always --dirty
-    symbols       TEXT NOT NULL,
-    start_ts      TEXT NOT NULL, end_ts TEXT NOT NULL,
-    n_rows        INTEGER, n_cols INTEGER,
-    artifact_path TEXT NOT NULL,            -- data/features/<run_id>.parquet
-    created_at    TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE label_run (
-    run_id        TEXT PRIMARY KEY,
-    config_json   TEXT NOT NULL,            -- horizon, tp_mult, sl_mult, cost model
-    code_version  TEXT NOT NULL,
-    artifact_path TEXT NOT NULL,
-    created_at    TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE model_run (
-    run_id               TEXT PRIMARY KEY,
-    feature_run_id       TEXT NOT NULL REFERENCES feature_run(run_id),
-    label_run_id         TEXT NOT NULL REFERENCES label_run(run_id),
-    model_kind           TEXT NOT NULL,     -- 'decision_tree' | 'hgb' | 'xgboost'
-    side                 TEXT NOT NULL,     -- 'long' | 'short'
-    params_json          TEXT NOT NULL,
-    cv_metrics_json      TEXT NOT NULL,
-    holdout_metrics_json TEXT,
-    artifact_path        TEXT NOT NULL,
-    created_at           TEXT NOT NULL
-) STRICT;
-
--- ── Audit log of what the system actually told you to do ─────────────────────
-CREATE TABLE decision (
-    id             INTEGER PRIMARY KEY,
-    model_run_id   TEXT NOT NULL REFERENCES model_run(run_id),
-    symbol         TEXT NOT NULL,
-    as_of          TEXT NOT NULL,           -- the session whose close drove it
-    action         TEXT NOT NULL,           -- 'LONG' | 'SHORT' | 'HOLD'
-    confidence     REAL NOT NULL,
-    entry_ref      REAL,
-    tp_price       REAL, sl_price REAL,
-    atr_at_signal  REAL,
-    max_hold_days  INTEGER,
-    rationale_json TEXT,                    -- top contributing features
-    created_at     TEXT NOT NULL,
-    UNIQUE (model_run_id, symbol, as_of)
-) STRICT;
-
--- Filled in later by `tdm score-decisions` (§13). This is the real scoreboard.
-CREATE TABLE decision_outcome (
-    decision_id   INTEGER PRIMARY KEY REFERENCES decision(id),
-    resolved_ts   TEXT NOT NULL,
-    exit_reason   TEXT NOT NULL,            -- 'tp' | 'sl' | 'timeout' | 'ambiguous'
-    exit_price    REAL NOT NULL,
-    gross_return  REAL NOT NULL,
-    net_return    REAL NOT NULL,
-    holding_days  INTEGER NOT NULL
-) STRICT;
-```
-
----
-
-## 6. Store raw, adjust on read — and why nothing ever needs invalidating
-
-This is the single most important schema decision, and it's a pure engineering problem —
-no finance knowledge needed to see why.
-
-**The domain fact:** when a company does a 10-for-1 **split**, every shareholder's 1 share
-becomes 10 shares, each worth 1/10th as much. Nothing of value changed. But the price
-series now has a 90% cliff in it at that date. So data providers offer *adjusted* prices:
-all history before the split is divided by 10, making the series continuous again.
-
-**The engineering problem:** an adjusted price is **a derived value computed from every
-corporate action that has happened since.** It is not a fact about the past; it's a
-function of the present. When a new split happens, *every historical adjusted price
-changes.*
-
-`yfinance` defaults to `auto_adjust=True`, so the obvious implementation stores exactly
-those adjusted numbers. Then:
-
-```
-Jan 2026:  fetch NVDA 2015-2025, store adjusted closes.      ✓ consistent
-Jun 2026:  NVDA does a 4:1 split.
-Jul 2026:  fetch NVDA 2026 (incremental). Provider now returns
-           everything on the NEW adjustment basis.
-           -> rows written before June and rows written after June
-              are on DIFFERENT SCALES, in the same table.
-```
-
-Your 200-day moving average now has a 75% discontinuity in the middle of it. **Nothing
-raises an error.** No constraint is violated. The data is just quietly wrong, and every
-model trained on it is wrong, and you will not find out from a stack trace.
-
-**The fix** — treat it like any derived-value caching problem: don't cache the derived
-value, cache the inputs and compute on read.
+**With no cache, that failure is impossible.** Every run downloads one internally
+consistent series. So we can simply use `auto_adjust=True` and let Yahoo do the
+adjustment:
 
 ```python
-# ingest: fetch and store the immutable facts
-df = yf.download(symbol, auto_adjust=False, actions=True)   # RAW prices
-store.upsert_bars(symbol, df[["Open","High","Low","Close","Volume"]])
-store.upsert_actions(symbol, df[["Dividends","Stock Splits"]])
-
-# read: derive adjustment at query time
-def read_bars(symbol: str, *, adjust: bool = True,
-              as_of: str | None = None) -> pd.DataFrame:
-    bars    = _raw_bars(symbol)
-    actions = _actions(symbol, before=as_of)      # as_of enables point-in-time reads
-    if adjust:
-        factor = _cumulative_adjustment_factor(actions, bars.index)
-        bars[["open","high","low","close"]] *= factor
-        bars["volume"] /= factor                  # ← inverse! see below
-    return bars
+df = yf.download(
+    tickers,                 # the whole list in one call
+    start=start, end=end,
+    interval="1d",
+    auto_adjust=True,        # ← now safe, because nothing persists
+    actions=False,
+    group_by="ticker",
+    multi_level_index=False,
+    threads=True,
+    progress=False,
+)
 ```
 
-Now `bar_daily` and `corporate_action` hold only immutable facts, adjustment is a pure
-function of the two, and a split arriving in June recomputes all history correctly with
-zero writes. The `as_of` parameter additionally gives you point-in-time reads, which §10.5
-needs.
+That removes `corporate_action`, the cumulative-adjustment-factor code, the inverse volume
+adjustment, and the `as_of` point-in-time read path. A genuinely large simplification.
 
-> **Easy bug to miss:** volume adjusts in the *opposite* direction. A 10:1 split means
-> historical share counts must be **multiplied** by 10 while prices are divided by 10.
-> `tests/test_indicators.py` should pin this against a real split — NVDA's 10:1 on
-> 2024-06-10 is a good fixture.
+### Why re-downloading doesn't change your features
 
-### 6.1 The derived features never need invalidating either
+The obvious worry: if a stock splits between two runs, the second run's prices are all
+rescaled. Doesn't that change the training data?
 
-Storing `(date, OHLCV)` as immutable rows is the right instinct, and it extends further
-than it first appears: **the computed indicator values are also permanent.** Worth proving
-rather than asserting, because it removes a whole category of work.
-
-**The claim.** Compute the feature matrix today. Tomorrow NVDA splits 10:1. Do any of
-yesterday's feature values change?
-
-**No — and here's why.** A corporate action rescales prices **multiplicatively**: every
-adjusted price before the action gets multiplied by the same constant `k`. And every
-feature in §8.5 is a **ratio**. So the `k` cancels:
+**No — and this is the result that makes the whole no-database approach sound.** A split
+rescales every pre-split price by the same constant `k`, and every feature in §8.5 is a
+*ratio*, so `k` cancels:
 
 | Feature | Under a rescale by `k` | Result |
 |---|---|---|
 | `close/EMA200 − 1` | `(k·C)/(k·EMA200) − 1` | **invariant** |
-| `ATR/close` | `(k·ATR)/(k·C)` | **invariant** |
+| `ATR/close` | both scale by `k` | **invariant** |
 | `%B` = `(C−lo)/(hi−lo)` | all three scale by `k` | **invariant** |
 | `MACD/ATR` | both scale by `k` | **invariant** |
 | RSI, Stochastic, ADX | built from price *ratios* | **invariant** |
 | `volume/median_volume` | both scale by `1/k` | **invariant** |
-| OBV slope, z-scored | scales by `1/k`, z-score normalizes it | **invariant** |
+| OBV slope, z-scored | scales by `1/k`, z-score normalizes | **invariant** |
 
-> **The §8.5 normalization rule was adopted so a decision tree's thresholds would transfer
-> across tickers. It turns out to buy immutability for free.** Scale-free and
-> corporate-action-invariant are the same property. That's a genuinely convenient
-> coincidence, and it's the reason your framing works.
+> **§8.5's normalization rule was adopted so a decision tree's thresholds would transfer
+> across tickers. It turns out to also make the feature matrix immune to re-downloading.**
+> Scale-free and corporate-action-invariant are the same property. That convergence is
+> what lets us throw away the storage layer without losing anything.
 
-**What this means concretely:**
+**This must be a test, not an assumption:** `tests/test_invariance.py` injects a synthetic
+10:1 split into a series, recomputes all features, and asserts every value before that
+date is bit-identical. Any feature that fails is not scale-free — which means it was also
+broken for §8.5's original reason. One assertion, two bug classes.
 
-- **A new split or dividend never invalidates a single historical feature row.** When one
-  arrives, you compute *forward* from that date. You never recompute history.
-- Since corporate actions only ever happen in the present, that forward computation is
-  the same incremental tail update you'd be doing anyway (§7). **So the cost of a split is
-  zero.**
-- The feature store can therefore be treated as **append-only**, keyed by
-  `(symbol, date, feature_set_hash)`. A row, once written, is correct forever.
+### The one real cost: run-to-run reproducibility
 
-**Two narrow exceptions** — both are "recompute a bounded window", not an invalidation
-protocol:
+What *does* differ between two runs is the tail (new bars arrive daily) and the rare
+provider restatement of a recent bar. That's harmless for daily use and corrosive for one
+specific activity: **comparing two models.**
 
-| Exception | Why | Scope of recompute |
-|---|---|---|
-| The provider **restates an old bar** (§7 — `revision` bumps) | The raw input genuinely changed, so it wasn't a fact after all | from that bar forward, by the longest feature warm-up (~200 bars) |
-| A **past** corporate action is discovered late | Rescaling only applies *before* the action date, so it introduces a step at that date; features whose lookback window spans it do change | a window around the action date |
+```
+Monday:    train model A, holdout expectancy 0.31
+Friday:    train model B, holdout expectancy 0.28
+           -> is B worse, or did the dataset change underneath you?
+```
 
-Both are rare, both are detectable (`revision`, and comparing `corporate_action` row
-counts after a fetch), and both are handled by recomputing a window rather than by
-tracking staleness.
+With a moving dataset you can't tell, and model comparison is the central activity of this
+project. So one thing survives from the old design:
 
-> **This is the test that proves it, and it belongs in the suite:**
-> `tests/test_invariance.py` — take a real series, inject a synthetic 10:1 split at a
-> chosen date, recompute all features, and **assert every feature value before that date
-> is bit-identical.** Any feature that fails this test is not scale-free, which means it's
-> also broken for §8.5's original reason. One assertion catches both bugs.
+> **Snapshot the feature matrix, not the bars.** `tdm features build` writes
+> `data/features/<run_id>.parquet` where `run_id = hash(tickers, date range, feature-set
+> config, code version)`, and `tdm train` records which `run_id` it consumed. Training
+> against a snapshot is the default; `--refresh` forces a new fetch.
 
-**The one thing this does *not* let us skip: the adjustment itself.** Computing indicators
-directly on raw prices across a split is still wrong — a 10:1 split injects one fake −90%
-return, which corrupts every window-based indicator for the length of its lookback (14
-bars for RSI, **200 bars for EMA200**). The feature *is* deterministic, so it's stable
-forever, but it's stably wrong. Raw prices are the right thing to *store*; the continuous
-series is the right thing to *compute on*. That's why `corporate_action` and
-`read_bars(adjust=True)` stay.
+That's a file and a hash — no schema, no migrations, no invalidation (per the invariance
+result above, a snapshot is correct forever). It costs ~20 lines and makes two model runs
+actually comparable, which is the difference between measuring and guessing.
+
+### What's on disk
+
+```
+data/
+├── raw/<run_id>.parquet          # optional: the downloaded OHLCV, for offline work
+├── features/<run_id>.parquet     # the feature matrix  ← the snapshot that matters
+├── labels/<run_id>.parquet       # y, t1, weights
+└── exports/*.csv                 # for eyeballing in Excel
+models/<run_id>/                  # fitted model + frozen thresholds + metrics.json
+reports/
+├── charts/<ticker>.html          # §7
+└── decisions_YYYY-MM-DD.md
+runs.jsonl                        # append-only provenance log (replaces the *_run tables)
+```
+
+`runs.jsonl` is one JSON object per pipeline run — tickers, date range, config hash, code
+version, artifact paths, metrics. Append-only, greppable, diffable, no schema. It's the
+provenance the previous project lacked, at about 1% of the complexity of the SQLite
+version.
 
 ---
 
-## 7. Incremental ingest: never download the same bar twice
+## 6. Fetching
 
-The user's explicit requirement. A cache-coherency problem with three wrinkles: the
-upstream is **intermittently available**, it has permanent holes that look identical to
-cache misses, and it revises recent rows.
-
-### 7.1 The upstream is flaky, not quota-limited
-
-Per the user: yfinance isn't rate-limited so much as **available only some of the time.**
-That's a different failure model from a quota, and it changes three things.
-
-> #### ⚠️ The bug this creates, which the first draft of this section had
->
-> An earlier version recorded any **empty response as a permanent `known_gap`**. Under a
-> quota model that's fine — a quota error is a distinct, recognizable failure. Under
-> *intermittent availability* it is a serious bug:
->
-> ```
-> run 1:  fetch NVDA 2019-01..2019-06   -> service flaky, returns EMPTY
->         -> 120 sessions written to known_gap as "no_data"
-> run 2+: planner subtracts known_gap   -> those 120 days are never requested again
->         -> six months of NVDA history permanently missing, and
->            `tdm db status` reports full coverage
-> ```
->
-> **Nothing errors.** You get a silently truncated series, your indicators have a hole in
-> them, and the coverage table cheerfully says everything is fine. This is the same class
-> of silent-wrongness as the adjusted-price bug in §6, and it's worse because the data
-> isn't recoverable without noticing first.
->
-> **The fix: an empty response is never, on its own, evidence of a gap.** A gap is only
-> trusted when *corroborated*:
->
-> | Evidence | Treatment |
-> |---|---|
-> | Fetch returned data for **other** dates in the same range, but not this one | `corroborated = 1` → trust it. The service clearly worked; the date genuinely has no bar |
-> | Fetch returned **entirely** empty | **Do not write a gap.** Log `status='empty'` and retry on a later run |
-> | A date has come back empty on **N separate runs** (default 3) on different days | `confirmations >= N` → accept as permanent |
-> | Before the ticker's known first bar | `reason='pre_ipo'` → trust immediately, it's structural |
->
-> Uncorroborated gaps stay **retryable**, so a flaky afternoon costs you one wasted request
-> later rather than a permanent hole.
-
-The other two consequences are more pleasant:
-
-- **Partial progress must be durable, and already is.** Fetching 50 tickers when the
-  service drops out at ticker 23 should commit the first 22 and resume cleanly.
-  `fetch_coverage` is per-symbol, so this works for free — a failed run is just a shorter
-  next run. Add `tdm fetch --retry-failed` to re-attempt everything in `fetch_log` with
-  `status IN ('error','unavailable','empty')`.
-- **Concurrency is fine.** With no quota to respect, there's no reason to serialize. Fetch
-  symbols in parallel with a modest cap (8–16) — and note yfinance 1.4.0 made `download()`
-  reentrant by removing shared module globals, so this is safer than it used to be. Keep
-  the cap configurable so it can be turned down if parallelism itself seems to trigger the
-  flakiness.
-
-Retries use exponential backoff with jitter, but the *reason* is different from a quota
-backoff: you're waiting for a service to come back, not serving a penalty. So retry
-budgets can be generous (say 5 attempts over a few minutes) rather than conservative.
-
-### The provider interface
-
-`ingest/` is the only package that touches the network, behind one protocol — so a
-different data source (crypto via `ccxt`, another broker's API) slots in without touching
-anything downstream:
+One module, `ingest/fetch.py`, and it stays small.
 
 ```python
-class Provider(Protocol):
-    name: str
-
-    def fetch_bars(self, symbol: str, start: date, end: date,
-                   interval: str = "1d") -> BarsResult:
-        """Raw, UNADJUSTED OHLCV.
-
-        Returns BarsResult(frame, served) where `served` distinguishes
-        "the provider answered" from "the provider was unreachable" —
-        the caller CANNOT infer this from an empty frame (§7.1).
-
-        Raises Unavailable (retryable) or ProviderError (fatal).
-        """
-
-    def fetch_actions(self, symbol: str) -> pd.DataFrame: ...
-    def fetch_metadata(self, symbol: str) -> dict: ...
+def fetch(tickers: list[str], years: int = 9) -> dict[str, pd.DataFrame]:
+    """Download daily OHLCV. Returns {ticker: frame}, adjusted, indexed by date."""
 ```
 
-> **Why `BarsResult` and not just a DataFrame.** An empty DataFrame is ambiguous — it
-> means either "no bars exist here" or "the service didn't answer", and §7.1 shows that
-> conflating those corrupts the cache. Making the provider report which one it was pushes
-> the distinction into the type, so the planner can't accidentally guess wrong.
+### Benchmarks are appended automatically
 
-### The sync planner
+You supply only the tickers you want to **trade** in `config/universe.txt`. The
+relative-strength and market-regime features (§8.2) need SPY and the relevant sector ETFs,
+so `fetch` adds them itself and tags them `tradeable=False`. They flow through features
+exactly like any other series and are filtered out at the decision step (§13).
 
-```python
-def plan(symbol: str, requested_start: date) -> list[DateRange]:
-    # 1. What days SHOULD exist? (market calendar, not just weekdays)
-    sessions = calendar.sessions_in_range(requested_start, today)
+So "no ETFs" (§1) stays true of your decisions, the features still work, and you never
+have to remember to add SPY by hand.
 
-    # 2. Which of those are final? A bar isn't trustworthy until the
-    #    session has actually closed. Running at 14:00 ET must not
-    #    cache a half-formed bar as if it were done.
-    last_final = calendar.last_closed_session(now, settle_lag)
-    target = [s for s in sessions if s <= last_final]
-
-    # 3. Subtract what we already have
-    cov = store.coverage(symbol, "1d", provider.name)
-    if cov is None:
-        missing = target                                        # cold start
-    else:
-        head     = [s for s in target if s <  cov.start_ts]     # extend backwards
-        tail     = [s for s in target if s >  cov.end_ts]       # the normal daily case
-        interior = [s for s in target if not store.has_bar(symbol, s)]   # heal holes
-        missing  = head + tail + interior
-
-    # 4. Subtract the permanent holes. Without this step the set never
-    #    empties and you re-request Thanksgiving 2019 forever.
-    missing = [s for s in missing if not store.is_known_gap(symbol, s)]
-
-    if not missing:
-        return []            # <-- the whole point: zero HTTP calls
-
-    # 5. One request per contiguous run, not one per day.
-    ranges = coalesce_contiguous(missing)
-
-    # 6. Always re-pull the last few sessions: the provider revises
-    #    recent bars (volume especially). Costs one request, keeps the
-    #    tail honest, and `revision` makes it visible when it happens.
-    ranges = widen_tail(ranges, RESTATE_LOOKBACK_SESSIONS)
-
-    return ranges
-```
-
-Then execute each range:
-
-```python
-res = retry(provider.fetch_bars, range, attempts=5, backoff="exp+jitter")
-
-if not res.served:                      # provider was unreachable (§7.1)
-    log(status="unavailable"); continue # NO gap written, range stays retryable
-
-store.upsert_bars(res.frame)            # bump `revision` where OHLCV changed
-store.upsert_actions(...)
-
-absent = set(range.sessions) - set(res.frame.index)
-if res.frame.empty:
-    log(status="empty")                 # uncorroborated -> bump confirmations only
-    store.touch_gap_candidates(absent)  # permanent only at confirmations >= 3
-else:
-    log(status="ok" if not absent else "partial")
-    store.mark_gap(absent, corroborated=True)   # the service answered: trust it
-
-store.recompute_coverage(symbol)
-```
-
-The asymmetry in that last branch is the whole point of §7.1: **absent dates are only
-trusted as real gaps when the same response returned data for other dates.**
-
-### Why each wrinkle needs its own mechanism
-
-| Wrinkle | Mechanism | What breaks without it |
-|---|---|---|
-| Market isn't open every day | `exchange_calendars` NYSE schedule | You treat ~10 holidays/year as missing data and re-request them every run |
-| Permanent holes (pre-IPO, halts) look like cache misses | `known_gap` table | The missing-set never converges; every run re-requests holes that can never fill |
-| Running mid-session | `last_final` + settle lag | You cache a partial bar whose "close" is just the last trade so far, as if final |
-| Provider revises recent rows | `RESTATE_LOOKBACK = 5` + `UPSERT` + `revision` | Your recent tail silently diverges from the source |
-| **Service only up some of the time** | `BarsResult.served` + `corroborated` / `confirmations` (§7.1) | **A flaky empty response becomes a permanent hole; history is silently truncated and coverage still reports OK** |
-| Service drops out mid-run | per-symbol `fetch_coverage` + `--retry-failed` | A 30-ticker run loses all 30 because ticker 23 failed |
-
-### Acceptance test
-
-The one that matters, and it's mechanically checkable:
+### Validate before downloading
 
 ```bash
-make fetch     # first run:  N HTTP calls
-make fetch     # second run: ZERO HTTP calls   <- assert this in CI
+tdm universe validate
 ```
 
-### CLI
-
-```bash
-tdm universe validate                          # check the ticker list BEFORE downloading
-tdm fetch                                      # incremental, universe from config
-tdm fetch --symbols NVDA,AMD --since 2018-11-01
-tdm fetch --dry-run                            # print the plan, make no calls
-tdm fetch --force --symbols NVDA               # ignore coverage, re-pull and UPSERT
-tdm db status                                  # coverage, gaps, staleness per symbol
-tdm db verify                                  # integrity: high>=low, no negatives,
-                                               # no dupes, no zero-volume non-holidays
-```
-
-`--dry-run` is how you test the planner without the network, and the first thing to reach
-for when a run is unexpectedly slow.
-
-### The universe is your input
-
-`config/universe.txt` is a plain list of tickers you provide, one per line. Nothing is
-hardcoded. Two things the ingest layer does with it:
-
-**1. `tdm universe validate` runs first and fails fast.** Downloading 8 years × N tickers
-takes a while, and you don't want to find out at ticker 48 that three of them were typos.
-It resolves each symbol against the provider and reports:
+9 years × 60 tickers is a few minutes; you don't want to discover at ticker 48 that three
+were typos. Checks each symbol and reports:
 
 | Check | Why |
 |---|---|
-| Symbol resolves at all | Catches typos and wrong suffixes (`BRK.B` vs `BRK-B` — Yahoo uses the dash) |
-| Has ≥ 8 years of history | ⚠️ A 2024 IPO can't give you 8 years. Flagged, not rejected — but a ticker with 300 bars contributes almost nothing and will have NaN for the 200-day features |
-| Currently active, not delisted | |
-| Median volume above the liquidity floor | A thin stock will just be gated out at decision time (§13), so it's dead weight in the universe |
-| Duplicates / blank lines | |
+| Symbol resolves | Catches typos and wrong suffixes — Yahoo wants `BRK-B`, not `BRK.B` |
+| Has ≥ 9 years of history | ⚠️ A 2024 IPO can't supply 9 years. Flagged, not rejected — but a ticker with 300 bars has NaN for every 200-day feature and contributes almost nothing |
+| Not delisted | |
+| Median volume above the liquidity floor | A thin stock just gets gated out at decision time (§13), so it's dead weight |
+| Duplicates, blank lines, whitespace | |
 
-**2. Benchmark tickers are appended automatically.** The relative-strength and regime
-features (§8.2) need SPY and the relevant sector ETFs. You list only what you want to
-*trade*; `sync` adds the benchmarks it needs with `tradeable = 0`. So "no ETFs" (§1) stays
-true of your decisions without breaking the features — and you never have to remember to
-add SPY by hand.
+### Practical details that still matter
+
+- **One batched call.** `yf.download()` accepts the whole ticker list and parallelises
+  internally (`threads=True`). Don't loop one ticker at a time.
+- **`multi_level_index=False`.** yfinance returns a MultiIndex column frame by default for
+  multiple tickers; flattening at the boundary keeps the rest of the code simple.
+- **Retries.** Even a reliable service has transient failures. Wrap the call in 3 attempts
+  with exponential backoff. If a ticker still fails, **drop it with a loud warning and
+  continue** — one bad symbol shouldn't kill a 60-ticker run.
+- **Validate what comes back** before computing anything on it: `high >= low`, `high >=
+  open/close`, no negative prices, no duplicate dates, index is sorted, no all-zero-volume
+  stretches. Cheap, and it catches provider glitches before they become confusing
+  indicator values.
+- ⚠️ **Smoke-test yfinance against pandas 3.1 first** (§3). It declares `pandas>=1.3.0`
+  with no upper bound, so it *installs* next to pandas 3.1, which is not the same as
+  working there. This is the first thing to verify in phase 1.
+
+---
+
+## 7. The HTML chart
+
+A visual read of every ticker with all of its indicators, written to self-contained
+interactive HTML.
+
+```bash
+tdm chart --ticker NVDA                  # -> reports/charts/NVDA.html
+tdm chart --all                          # every ticker in the universe
+tdm chart --ticker NVDA --with-labels    # overlay the triple-barrier outcomes
+tdm chart --ticker NVDA --with-decisions # overlay the model's calls
+```
+
+**Library: Plotly** (7.1.0, pure-Python, works on 3.15). `go.Candlestick` +
+`make_subplots` + `write_html` gives one self-contained file with zoom, pan and hover
+tooltips, no server and no build step. Bokeh is comparable; `lightweight-charts` looks
+more like TradingView but needs JS plumbing; matplotlib/mplfinance give static PNGs, which
+are much less useful for actually *reading* a series.
+
+### Layout
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ NVDA   2017-11-03 → 2026-11-03   9y daily                  │
+├────────────────────────────────────────────────────────────┤
+│ PRICE  candlesticks                                   60%  │
+│        + EMA 8/21/50/200        + Bollinger(20,2)          │
+│        + Keltner  + Supertrend  + Ichimoku cloud           │
+│        + anchored VWAP          + ZigZag pivots ◆          │
+│        + Donchian / 52w high                               │
+│        [--with-labels]    TP/SL brackets, green=win red=loss│
+│        [--with-decisions] ▲ LONG  ▼ SHORT  · HOLD          │
+├────────────────────────────────────────────────────────────┤
+│ VOLUME bars, coloured by up/down + 20d median line     8%  │
+├────────────────────────────────────────────────────────────┤
+│ RSI(14) + RSI(2), bands at 30/70                       8%  │
+├────────────────────────────────────────────────────────────┤
+│ MACD/ATR line + signal + histogram                     8%  │
+├────────────────────────────────────────────────────────────┤
+│ ADX(14) + (+DI − −DI), bands at 20/25                  8%  │
+├────────────────────────────────────────────────────────────┤
+│ Stochastic %K/%D  ·  MFI  ·  OBV slope z-score          8%  │
+└────────────────────────────────────────────────────────────┘
+      shared, linked x-axis — zoom one panel, all follow
+```
+
+### Three design rules
+
+**1. Render from the feature matrix, never recompute.**
+
+```python
+# RIGHT: chart the exact numbers the model will see
+features = pd.read_parquet(f"data/features/{run_id}.parquet")
+plot(features.loc[ticker])
+
+# WRONG: a second implementation that can silently disagree
+plot(talib.RSI(bars.close, 14))
+```
+
+> This is the whole point of the chart. If it draws its own indicators, then when a value
+> looks wrong you don't know whether the bug is in the feature pipeline or the plotting
+> code — and worse, the chart can look perfect while the model trains on garbage. Charting
+> the actual feature columns makes the picture **evidence** about the model's input. Same
+> principle as §11's "one implementation, shared" rule.
+
+**2. Visual verification catches what unit tests don't.**
+
+Unit tests confirm RSI(14) matches a reference value. They do not catch: an indicator
+off by one bar, a ZigZag pivot drawn with hindsight (§8.4 — *this is visible instantly on
+a chart and nearly invisible in a test*), a warm-up period filled with zeros instead of
+NaN, a feature that's flat for 200 bars, or an anchored VWAP anchored to the wrong pivot.
+Thirty seconds of looking at `NVDA.html` is one of the highest-value debugging steps in
+the project, and it's why this is stage 3 — **before** training, not after.
+
+**3. Overlay the labels, because the labeler is the hardest part to verify.**
+
+`--with-labels` draws each labeled entry as a TP/SL bracket, coloured by outcome. This is
+how you sanity-check §9 by eye:
+
+- Are TP/SL distances sane relative to the candles, or absurdly wide/narrow?
+- Do the winners look like they were genuinely going somewhere?
+- Is the ambiguous-bar count (TP and SL in the same bar) visibly high?
+- During March 2020, are the brackets enormous? **They should be** — ATR exploded, so
+  ATR-scaled barriers widened with it. Seeing that confirms §10.1's `max_vol` gate is
+  needed and that the ATR scaling works as intended.
+
+### Also worth generating
+
+| Report | Content |
+|---|---|
+| `reports/feature_corr.html` | correlation heatmap — drives the dedup step in §8.3 |
+| `reports/feature_dist.html` | per-feature histogram + NaN count + trailing-z sanity. Catches a feature that's constant, or 90% NaN, in one glance |
+| `reports/equity.html` | backtest equity curve per fold (§11), plus the shuffled-signal control |
+| `reports/tree.txt` | the depth-4 baseline's rule set as plain text (§10.1) — readable in a terminal |
 
 ---
 
@@ -1007,9 +721,9 @@ below, because these are data-modelling bugs, not finance opinions.
 > **ETFs are read but never traded.** The universe excludes ETFs *as trading candidates*
 > (§1), but SPY and the sector ETFs are still fetched and used as **benchmark inputs** to
 > the features above — relative strength is meaningless without something to be relative
-> *to*. That's what `instrument.tradeable = 0` is for (§5): these rows flow through ingest
-> and features exactly like any other ticker, and are filtered out only at the decision
-> step (§13). Don't let "exclude ETFs" collapse into "don't download SPY."
+> *to*. That's what the `tradeable=False` tag is for (§6): they flow through fetch and
+> features exactly like any other ticker, and are filtered out only at the decision step
+> (§13). Don't let "exclude ETFs" collapse into "don't download SPY."
 
 **Tier 2 — cheap and complementary, given TA-Lib is already a dependency**
 
@@ -1364,41 +1078,143 @@ tuning, whether a profile is even worth modeling:
 
 ## 10. Model and validation
 
-### 10.1 Model choice
+### 10.1 Model choice — XGBoost or Random Forest?
 
-The user asked for "a simple decision tree (you can suggest as well)". My suggestion is
-**both**, doing two different jobs:
+You asked directly, so here's the direct answer: **start with
+`HistGradientBoostingClassifier`, and always report Random Forest alongside it as a
+control.** Reach for XGBoost only at the refinement stage, and for one specific reason
+(monotonic constraints — below).
 
-| Role | Model | Why |
+But the more useful answer is the caveat first.
+
+> #### ⚠️ Model choice is not the bottleneck here
+>
+> Swapping Random Forest for XGBoost will move your hit rate by **one or two points**.
+> For comparison:
+>
+> | Issue | Impact on results |
+> |---|---|
+> | One undetected leak (§10.5) | the entire result — a worthless model that looks excellent |
+> | Getting the cost model wrong (§11) | ~8 points of break-even hit rate |
+> | Features containing no real signal | the entire result |
+> | Universe too small to measure anything (§16 #1) | you can't tell if it worked |
+> | **RF vs XGBoost** | **1–2 points** |
+>
+> Spend your effort in that order. Model choice is the last ~5% of this problem, and it's
+> the part most people spend 80% of their time on.
+
+### The ladder, in order
+
+| # | Model | Role |
 |---|---|---|
-| **Readable baseline** | `DecisionTreeClassifier(max_depth=3..5, class_weight="balanced", min_samples_leaf≈2%)` | You can print the entire rule set and read it. This tells you whether the model found something sensible or something absurd. **Keep it permanently as a sanity check**, not just as a first step. |
-| **Workhorse** | `HistGradientBoostingClassifier` (sklearn, no extra dependency) | ✅ **Handles NaN natively** — a significant practical win, since every indicator has a warm-up period and a 200-EMA feature is NaN for the first 200 bars of each ticker. Fast, strong on tabular data, built-in early stopping. |
-| Alternative | `xgboost` 3.4.1 | Comparable. Worth it for monotonic constraints or GPU; otherwise it's a dependency for marginal gain. Start with HGB. |
-| Variance check | `RandomForest` / `ExtraTrees` | Cheap baseline. If it beats HGB, your HGB is overfit. |
+| 1 | `DecisionTreeClassifier(max_depth=3..4)` | **Readable baseline.** Print the whole rule set (`reports/tree.txt`) and read it. It tells you whether the model found something sensible (`ADX>25 and EMA stack aligned and RSI<70 → long`) or something absurd. **Keep this permanently**, not just as a first step — it's your sanity check on everything above it. |
+| 2 | `RandomForestClassifier` | **The control.** Few knobs, hard to misuse, robust to noise. Its job is diagnostic: **if RF beats your boosted model out-of-sample, the boosted model is overfit.** Always report it. |
+| 3 | **`HistGradientBoostingClassifier`** | **The workhorse — start here.** |
+| 4 | `xgboost` | Refinement, for monotonic constraints. |
 
-> #### Sample size: the consequence of choosing 8 years
+### Why HistGradientBoosting over XGBoost to start
+
+Both are gradient-boosted trees and will perform within a point or two of each other. HGB
+wins on practicalities:
+
+- ✅ **Native NaN handling.** This genuinely matters: every indicator has a warm-up period,
+  so a 200-EMA feature is NaN for the first 200 bars of *every* ticker. HGB routes NaNs
+  down a learned branch. With RF you must impute first, and imputation on time-series
+  features is its own source of subtle bugs.
+- ✅ **Already in sklearn** — no extra dependency, and it composes with
+  `CalibratedClassifierCV` and the custom CV splitter without adapters.
+- ✅ **Built-in early stopping**, which is your main defence against overfitting.
+- ✅ **Native categorical support** for sector.
+- ✅ **Fewer hyperparameters** than XGBoost — which, as the next box argues, is a *feature*
+  on a dataset this size.
+
+### Why Random Forest is not the primary choice (but must be reported)
+
+RF reduces **variance** by averaging deep trees. Boosting reduces **bias** by sequentially
+fitting what the previous trees got wrong, which makes it more statistically efficient at
+extracting a weak signal — and a weak signal is precisely what we have.
+
+The counter-argument is real though: **boosting overfits noisy data more readily, and
+financial data is the textbook case.** That's exactly why RF is a required control rather
+than an afterthought. The comparison is informative in both directions:
+
+| Outcome | Reading |
+|---|---|
+| HGB > RF on the holdout | boosting is extracting real signal. Good. |
+| **RF ≥ HGB on the holdout** | **HGB is fitting noise.** Increase regularization, or ship RF. |
+| Both ≈ the depth-4 tree | there are only a few real effects here. Ship the tree — it's readable and you'll trust it. |
+| All three ≈ base rate | the features don't contain signal. No model fixes that. |
+
+That last row is a real possible outcome, and finding it out in week 6 rather than month 6
+is worth the 20 minutes it costs to run all three.
+
+> #### Regularization matters more than which library you pick
+>
+> On ~6,000 effective samples (below) with very low signal-to-noise, the settings matter
+> more than the algorithm. Shallow and slow:
+>
+> ```python
+> HistGradientBoostingClassifier(
+>     max_depth=3,                  # SHALLOW. not 6, not None
+>     learning_rate=0.03,           # slow
+>     max_iter=2000,                # high, but...
+>     early_stopping=True,          # ...stopped by validation loss
+>     n_iter_no_change=50,
+>     min_samples_leaf=100,         # ~2% of effective samples
+>     l2_regularization=1.0,
+>     max_features=0.7,             # decorrelate the trees
+> )
+> ```
+>
+> The instinct to set `max_depth=6` and `n_estimators=1000` is how you get a beautiful
+> training curve and a worthless model. **Every hyperparameter you tune is another chance
+> to overfit the validation folds**, which is a second reason to prefer HGB's smaller
+> parameter surface, and a reason to keep the search small and coarse.
+
+### What `xgboost` adds, and when to reach for it
+
+One thing worth the dependency, at the refinement stage: **monotonic constraints.** You
+can tell XGBoost that a feature's effect must be non-decreasing — e.g. "all else equal,
+higher ADX must not *decrease* `P(trend continues)`". This encodes domain knowledge
+directly into the hypothesis space, which **reduces overfitting by making the model unable
+to learn implausible shapes.** On a small, noisy dataset that's a genuine edge, and
+sklearn's HGB supports it too (`monotonic_cst`) though less flexibly. Also worth it for
+GPU training or fine control of `scale_pos_weight`.
+
+### What not to use
+
+| Model | Why not |
+|---|---|
+| **CatBoost** | ⚠️ **No `cp315` wheel** (wheels stop at `cp314`), so it cannot be installed on this Python. Would otherwise be a reasonable third option. |
+| **LightGBM** | Fine, installs cleanly, but it's a third boosting library with no advantage over HGB here. Leaf-wise growth also overfits small data more readily unless carefully capped. |
+| **Neural networks / LSTMs** | See the sample-size box below. On tabular data at this scale, boosted trees beat deep nets consistently in published benchmarks. The previous project carried a `torch` dependency; drop it. |
+| **Stacking / ensembling the above** | Tempting and almost always a way to overfit the validation folds on a dataset this size. Revisit only if a single model shows a solid holdout edge first. |
+
+> #### Sample size: the consequence of choosing 9 years
 >
 > This governs how complex a model you can justify, so it's worth the arithmetic.
 >
 > | | |
 > |---|---|
-> | 8 years × ~252 sessions | **~2,016 bars per ticker** |
-> | ÷ horizon 10 (labels overlap — §9) | **~200 *effective independent* samples per ticker** |
-> | × 9 tickers | ~1,800 effective samples |
-> | × 30 tickers | ~6,000 effective samples |
-> | × 60 tickers | ~12,000 effective samples |
+> | 9 years × ~252 sessions | **~2,268 bars per ticker** |
+> | ÷ horizon 10 (labels overlap — §9) | **~227 *effective independent* samples per ticker** |
+> | × 9 tickers | ~2,000 effective samples |
+> | × 30 tickers | ~6,800 effective samples |
+> | × 60 tickers | ~13,600 effective samples |
 >
-> With 9 tickers the row count *looks* like 18,000. The information content is ~1,800.
-> **That smaller number is what should govern model complexity.**
+> With 9 tickers the row count *looks* like 20,000. The information content is ~2,000.
+> **That smaller number is what should govern model complexity** — it's why §10.1 insists
+> on `max_depth=3` and `min_samples_leaf≈100`.
 >
 > **The key relationship: `effective samples ≈ tickers × years × 25`.** Years and tickers
-> are interchangeable for statistical power, so the two knobs trade off directly.
+> are interchangeable for statistical power, so the two knobs trade off directly — and
+> tickers are the cheaper one to turn.
 >
-> **8 years instead of 5 buys ~1.6× the power** — a real gain, and it costs nothing but
-> download time. It also changes what's *in* the window:
+> What 9 years puts in the window:
 >
 > | Period | What it contributes |
 > |---|---|
+> | Feb 2018 | a sharp volatility spike |
 > | late 2018 | a ~20% correction |
 > | 2019 | steady bull |
 > | **Feb–Mar 2020** | **the COVID crash — a ~34% drop in five weeks** |
@@ -1406,10 +1222,10 @@ The user asked for "a simple decision tree (you can suggest as well)". My sugges
 > | 2022 | a ~25% bear market |
 > | 2023–26 | bull, then the current regime |
 >
-> That's two bear markets plus a volatility shock — about as much regime diversity as any
-> 8-year window could offer. You'd argued COVID wasn't essential because technical setups
-> recur; at 8 years you get it included anyway, which is a free hedge against that
-> assumption being wrong.
+> Two bear markets plus two volatility shocks — about as much regime diversity as any
+> 9-year window could offer. You'd argued COVID wasn't essential because technical setups
+> recur; at 9 years you get it anyway, which is a free hedge against that assumption
+> being wrong.
 >
 > **Two notes on including the COVID period:**
 >
@@ -1421,7 +1237,7 @@ The user asked for "a simple decision tree (you can suggest as well)". My sugges
 > 2. ⚠️ **But it interacts badly with 10× leverage, and that needs handling** — see the
 >    box below.
 >
-> The recommendation remains **"more tickers"** (§16 #1): 8 years is now a decent base, but
+> The recommendation remains **"more tickers"** (§16 #1): 9 years is a solid base, but
 > tickers are the knob that also attacks survivorship bias (§10.5 #7), which adding years
 > does not.
 
@@ -1451,7 +1267,7 @@ The user asked for "a simple decision tree (you can suggest as well)". My sugges
 > the market-regime features (§8.2) still let the model learn "conditions like these are
 > dangerous." Only the *tradeable samples* are filtered.
 
-**No neural networks.** Effective sample size is ~1,800–12,000 depending on universe size
+**On sample size and model capacity.** Effective sample size is ~2,000–13,600 depending on universe size
 (above). On tabular data at that scale, gradient-boosted trees consistently beat deep nets
 in published benchmarks. The previous project carried a `torch` dependency; drop it. If you
 later want sequence models, that's an argument for *more tickers first*, not a deeper
@@ -1501,12 +1317,10 @@ fold 3:  |=========== train =======| purge | embargo |== test ==|
   the peek a deliberate act you'll remember, because each peek spends a little of its
   honesty.
 
-> **Why 12 months.** With 8 years of history (§10.1) a 12-month holdout is ~12.5% of the
-> data — a comfortable fraction, leaving 7 years for walk-forward CV. (At the earlier
-> 5-year plan an 18-month holdout would have been 30% and starved training; 8 years makes
-> this a non-issue.)
+> **Why 12 months.** With 9 years of history (§10.1) a 12-month holdout is ~11% of the
+> data — a comfortable fraction, leaving 8 years for walk-forward CV.
 >
-> ⚠️ **The holdout is still the tightest constraint on your conclusion.** 12 months is ~25
+> ⚠️ **The holdout is the tightest constraint on your conclusion.** 12 months is ~25
 > effective samples per ticker, so with 9 tickers the holdout carries ~225 — and once the
 > §13 threshold filters most bars out, the surviving *trade* count can fall below the
 > ~100-trade minimum from §10.4. **That would make the final go/no-go verdict itself
@@ -1800,9 +1614,9 @@ Worth calibrating before you see a number, so you can tell success from self-dec
   short setups have a worse base rate. CFDs remove the mechanical obstacles (§11.1) but
   not that drift. If `M_short` shows no out-of-sample edge, **ship long-only.** That's a
   finding, not a defeat.
-- **Expect wide confidence intervals, and check them.** With 8 years the effective
-  independent sample count is roughly `tickers × 200` (§10.1) — ~1,800 at 9 tickers,
-  ~6,000 at 30. Distinguishing a 40% hit rate from a 45% one needs on the order of a
+- **Expect wide confidence intervals, and check them.** With 9 years the effective
+  independent sample count is roughly `tickers × 227` (§10.1) — ~2,000 at 9 tickers,
+  ~6,800 at 30. Distinguishing a 40% hit rate from a 45% one needs on the order of a
   thousand independent trades, so **report confidence intervals on the hit rate, not just
   the point estimate.** If the interval straddles the ~42% break-even, the honest readout
   is "inconclusive", not "profitable". **This is the strongest argument for a wider
@@ -1819,9 +1633,8 @@ def decide(symbol: str, as_of: date) -> Decision:
     x = features.load(symbol, as_of)          # from Parquet, not recomputed
 
     # ── Hard gates. Preconditions the model cannot see. Checked FIRST.
-    inst = instrument(symbol)
-    if not inst.tradeable:
-        return SKIP("data-only instrument (ETF/benchmark)")   # §8.2
+    if not universe.is_tradeable(symbol):
+        return SKIP("data-only instrument (ETF/benchmark)")   # §6, §8.2
     if data_staleness(symbol) > 1:
         return ABSTAIN("stale data")          # ← fail loud, see below
     if adv_20d(symbol) < cfg.min_liquidity:
@@ -1880,8 +1693,9 @@ that drifts between runs makes your track record uninterpretable.
 > stale prices. Silent degradation is the worst failure mode for a tool you check once a
 > day and trust. Fail loud.
 
-**Output:** a `rich` table on stdout, `reports/decisions_YYYY-MM-DD.{md,csv}`, and a row
-in the `decision` table.
+**Output:** a `rich` table on stdout, `reports/decisions_YYYY-MM-DD.{md,csv}`, and one
+appended line in `decisions.jsonl` — the log that §13's self-scoring reads back. Keep that
+file forever; it is the only truly out-of-sample record you will ever have.
 
 ### Self-scoring — build this early, not last
 
@@ -1890,8 +1704,9 @@ tdm score-decisions --since 2026-01-01
 ```
 
 Walks every past row in `decision`, resolves it against bars that have since arrived,
-fills `decision_outcome`, and reports realized hit rate / expectancy / drawdown **of the
-decisions the system actually issued**.
+Reads the appended decision log, resolves each past decision against bars that have since
+arrived, and reports realized hit rate / expectancy / drawdown **of the decisions the
+system actually issued**.
 
 **This is the only genuinely out-of-sample measurement you will ever have.** No purging
 subtleties, no leakage, no survivorship bias — just a prediction log and what happened
@@ -1908,20 +1723,27 @@ Each phase ends somewhere useful, so you can stop or re-scope without a half-bui
 | Phase | Deliverable | Done when |
 |---|---|---|
 | **0 · Scaffold** | venv 3.15, `CLAUDE.md`, Makefile, test runner | `make venv && make test` green; the venv guard fires outside the venv |
-| **1 · Store + ingest** | schema, migrations, yfinance adapter, sync planner | `make fetch` twice ⇒ **second run makes zero HTTP calls**; `tdm db verify` clean. **Smoke-test yfinance against pandas 3.1 here** (§3) |
-| **2 · Indicators** | registry + Tier-1 + the requested list, Parquet output, CSV export | spot-checks match a charting tool; `test_indicators.py` green; correlation report produced |
-| **3 · Structure features** | ZigZag + Dow/Elliott with `confirmed_at` | `test_leakage.py` pivot tests green |
-| **4 · Labels** | triple barrier, `t1`, weights, `labels sweep` | base rate / holding period / ambiguity rate sane across profiles |
-| **5 · Baseline model** | depth-4 tree + purged walk-forward CV | **the printed rule set is readable and not absurd** |
-| **6 · Workhorse** | HGB + calibration + permutation importance + threshold tuning | beats the depth-4 tree on expectancy, on validation folds |
-| **7 · Backtest** | engine, costs, sensitivity grid, shuffled control | survives 2× slippage; beats the shuffled control |
-| **8 · Decide** | `tdm decide`, gates, reports, `decision` table | one command, end to end |
-| **9 · Self-scoring** | `tdm score-decisions` | reproduces phase-7 numbers on the overlapping window |
-| **10 · Holdout** | one single evaluation on the untouched 12 months | **go / no-go** |
+| **1 · Fetch** | `yf.download` wrapper, `universe validate`, OHLCV sanity checks, Parquet snapshot | 9 years × your tickers lands clean. ⚠️ **Smoke-test yfinance against pandas 3.1 here** (§3) — it is the one unverified dependency |
+| **2 · Indicators** | registry + Tier-1 + your requested list, Parquet output, CSV export | `test_indicators.py` green; `test_invariance.py` green (§5) |
+| **3 · Chart** | Plotly multi-panel HTML per ticker (§7) | **you open `NVDA.html` and the indicators look right.** This is the gate on phases 1–2 — do not proceed past a chart that looks wrong |
+| **4 · Structure features** | ZigZag + Dow/Elliott with `confirmed_at` | `test_leakage.py` pivot tests green, **and the pivots look right on the chart** — hindsight pivots are obvious visually and nearly invisible in a test |
+| **5 · Labels** | triple barrier, `t1`, weights, `labels sweep` | base rate / timeout fraction / ambiguity rate sane; **TP/SL brackets look sane on the chart** (`--with-labels`) |
+| **6 · Baseline model** | depth-4 tree + purged walk-forward CV | **the printed rule set is readable and not absurd** |
+| **7 · Model comparison** | HGB + RandomForest control + calibration + permutation importance + threshold tuning | all three compared on the same folds (§10.1); you know which row of that table you are in |
+| **8 · Backtest** | engine, costs, sensitivity grid, shuffled control | survives 2× slippage; beats the shuffled control |
+| **9 · Decide** | `tdm decide`, gates, reports | one command, end to end |
+| **10 · Self-scoring** | `tdm score-decisions` | reproduces phase-8 numbers on the overlapping window |
+| **11 · Holdout** | one single evaluation on the untouched 12 months | **go / no-go** |
 
-Phases 1 and 9 are what make this different from the previous attempt. **If you only reach
-phase 5**, you still have a clean cached dataset, a reproducible feature pipeline, and a
-readable baseline — already enough to iterate on.
+**Phase 3 is deliberately early.** Charting before labeling or training means you catch
+feature bugs while they are still cheap — an off-by-one indicator or a lookahead pivot is
+obvious on a chart and nearly undetectable in a metric. A model trained on quietly broken
+features still produces a plausible-looking number, which is the worst outcome available.
+
+Phases 3 and 10 — the chart and the self-scoring — are what make this different from
+the previous attempt. **If you only reach
+phase 3**, you still have a reproducible feature pipeline and readable charts of every
+ticker — already a useful analysis tool on its own, independent of any model.
 
 ---
 
@@ -1929,29 +1751,32 @@ readable baseline — already enough to iterate on.
 
 | # | Question | Resolution |
 |---|---|---|
-| 1 | Asset class | **US stocks only, no ETFs** as trading candidates. ETFs still ingested as benchmarks with `tradeable = 0` (§8.2) |
-| 1b | Universe source | **User-supplied ticker list** in `config/universe.txt`. No hardcoded universe, no IQ Option intersection logic — §7 |
-| 2 | History depth | **8 years** (~2,016 bars/ticker). Covers the 2018 correction, the 2020 COVID crash and the 2022 bear market — §10.1 |
+| 1 | Asset class | **US stocks only, no ETFs** as trading candidates. ETFs still fetched as benchmarks, tagged `tradeable=False` (§6) |
+| 1b | Universe source | **User-supplied ticker list** in `config/universe.txt`; benchmarks appended automatically — §6 |
+| 2 | History depth | **9 years** (~2,268 bars/ticker). Covers Feb 2018, the 2020 COVID crash and the 2022 bear market — §10.1 |
 | 3 | Label profile | **TP 2.0 / SL 1.0 ATR.** Confirmed. `labels sweep` will still test wider profiles, because §11's cost arithmetic favours them |
 | 4 | Horizon | **10 trading days.** Explained in §9 — it's the timeout barrier |
 | 5 | Can you short? | **Yes**, and via CFDs it's mechanically symmetric with going long (§11.1) |
 | 6 | Execution venue | **IQ Option stock CFDs, 10× leverage.** Drove the §11.1 rewrite: Reg SHO and share-borrow modeling deleted; financing and margin added |
 | 7 | Earnings data | **Not required.** OHLCV-only, with a derived quarterly-gap proxy (§8.2.1). Real calendar stays behind a config flag |
 | 8 | Weekly features | **Dropped.** Removes a leakage class (§8.2) |
+| 9 | Storage | **No database.** Re-download each run; snapshot only the feature matrix for reproducibility — §5 |
+| 10 | Visualization | **Plotly HTML chart per ticker, generated before training** — §7, build phase 3 |
+| 11 | Model | **HistGradientBoosting primary, RandomForest as a required control**, depth-4 tree as the readable baseline — §10.1 |
 
 ---
 
 ## 16. Still open
 
 1. **How many tickers?** ⚠️ **Still the most consequential open item**, and the only one
-   left that changes whether the results are interpretable. 8 years gives
-   `tickers × 200` effective samples (§10.1):
+   left that changes whether the results are interpretable. 9 years gives
+   `tickers × 227` effective samples (§10.1):
 
    | Tickers | Effective samples | 12-month holdout | Verdict quality |
    |---|---|---|---|
-   | 9 | ~1,800 | ~225 | ⚠️ too thin for a confident go/no-go |
-   | 30 | ~6,000 | ~750 | workable |
-   | 60 | ~12,000 | ~1,500 | good |
+   | 9 | ~2,000 | ~225 | ⚠️ too thin for a confident go/no-go |
+   | 30 | ~6,800 | ~750 | workable |
+   | 60 | ~13,600 | ~1,500 | good |
 
    **Recommendation: 30 minimum, 50–60 preferred, spread across sectors** rather than
    concentrated in tech. Nine mega-cap tech names are also highly correlated with each

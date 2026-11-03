@@ -69,12 +69,27 @@ make label                                    # triple-barrier labels
 ./venv/bin/python -m tdm.cli labels sweep      # compare TP/SL/horizon profiles
 ```
 
+### Charts
+
+```bash
+make charts                                   # -> reports/charts/<ticker>.html
+./venv/bin/python -m tdm.cli chart --ticker NVDA
+./venv/bin/python -m tdm.cli chart --ticker NVDA --with-labels     # TP/SL outcomes
+./venv/bin/python -m tdm.cli chart --ticker NVDA --with-decisions  # model calls
+```
+
+Interactive Plotly HTML: candlesticks with every overlay, plus linked subpanels for RSI,
+MACD, ADX, Stochastic and volume. **Look at these before training** — feature bugs are
+obvious on a chart and nearly invisible in a metric.
+
 ### Train & evaluate
 
 ```bash
 make train                                     # purged walk-forward CV
 ./venv/bin/python -m tdm.cli train --model decision_tree    # readable baseline
-./venv/bin/python -m tdm.cli train --model hgb              # workhorse
+./venv/bin/python -m tdm.cli train --model hgb              # primary
+./venv/bin/python -m tdm.cli train --model rf               # required control
+./venv/bin/python -m tdm.cli train --compare                # all three, same folds
 ./venv/bin/python -m tdm.cli explain --run-id <id>          # rules + importances
 
 make backtest
@@ -94,18 +109,19 @@ make decide
 
 | File | Purpose |
 |---|---|
-| `config/universe.txt` | **your** tickers, one per line. Benchmarks (SPY etc.) are added automatically |
+| `config/universe.txt` | **your** tickers, one per line. Benchmarks (SPY etc.) added automatically |
 | `config/config.toml` | horizon, ATR multiples, costs, thresholds, position sizing |
 | `config/feature_sets/*.toml` | which indicators to compute |
 
 ## Layout
 
 ```
-data/      SQLite price cache, Parquet features, CSV exports   (gitignored)
-models/    trained artifacts                                    (gitignored)
-reports/   daily decisions, backtest plots                      (gitignored)
-src/tdm/   the package
-tests/     see tests/test_leakage.py — the most important tests here
+data/        Parquet feature/label snapshots, CSV exports   (gitignored)
+models/      trained artifacts + frozen thresholds          (gitignored)
+reports/     charts/, equity.html, daily decisions          (gitignored)
+runs.jsonl   append-only provenance log                     (gitignored)
+src/tdm/     the package
+tests/       see tests/test_leakage.py — the most important tests here
 ```
 
 ## Development

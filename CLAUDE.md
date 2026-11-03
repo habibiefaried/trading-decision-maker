@@ -61,23 +61,14 @@ behaviour, update the relevant section in the same commit.
 
 Each of these has burned this class of project before. DESIGN.md explains why.
 
-1. **Never store adjusted prices.** `bar_daily` holds raw, unadjusted OHLCV; adjustment
-   is applied at read time from `corporate_action`. Splits rewrite adjusted history
-   retroactively, so a cache of adjusted closes goes silently stale. (§6)
-   **Corollary — the feature store is append-only.** Because every feature is scale-free
-   (rule 12), corporate actions cannot change a past feature value. A new split means
-   compute *forward*; never invalidate or recompute history. The only recompute triggers
-   are a `revision` bump on an old bar, or a late-discovered past action. (§6.1)
-2. **Never fetch a date range already covered.** Go through `ingest/sync.py`, which
-   consults `fetch_coverage` and `known_gap`. Fetching twice is the bug this repo
-   exists to avoid. (§7)
-   **Never write a `known_gap` from an empty response alone.** yfinance is only
-   intermittently available, so an empty frame means either "no bars exist" or "the
-   service was down" — and recording the second as permanent silently truncates history
-   while coverage still reports OK. A gap needs corroboration: the same response
-   returned other dates in that range, or 3+ empties on separate runs, or it predates
-   the ticker's first bar. Providers return `BarsResult(frame, served)` so this is never
-   a guess. (§7.1)
+1. **There is no database.** The pipeline is stateless: re-download on every run,
+   `auto_adjust=True`, recompute everything. Do not add SQLite, a schema, migrations,
+   coverage tracking or gap bookkeeping — all of that was deliberately deleted. (§5)
+2. **Snapshot the feature matrix, not the bars.** `data/features/<run_id>.parquet` where
+   `run_id = hash(tickers, date range, feature config, code version)`, and append a line
+   to `runs.jsonl`. This exists so two model runs are comparable; without it you cannot
+   tell a worse model from a changed dataset. Training reads a snapshot by default;
+   `--refresh` forces a new fetch. (§5)
 3. **No lookahead, ever.** A feature on date *d* may only use bars up to and including
    *d*. In particular: ZigZag pivots must respect `confirmed_at`; z-scores and percentile
    ranks use trailing windows only (never `fit()` on the full series). (§8.5, §10.5)
@@ -106,14 +97,32 @@ Each of these has burned this class of project before. DESIGN.md explains why.
     partial-bar leakage hazard entirely. (§8.2, §8.4)
 12. **Every feature must be scale-free** — a ratio, a bounded oscillator, or a trailing
     z-score/percentile. Never raw dollars (price, EMA, MACD, band levels) and never an
-    unbounded cumulative sum (OBV). This has two independent payoffs: tree thresholds
-    transfer across tickers, and features become invariant to splits and dividends.
-    `tests/test_invariance.py` enforces it by injecting a synthetic split and asserting
-    past feature values are unchanged. (§8.5, §6.1)
+    unbounded cumulative sum (OBV). Two independent payoffs: tree thresholds transfer
+    across tickers, and features become invariant to splits — which is what makes
+    re-downloading safe. `tests/test_invariance.py` enforces it by injecting a synthetic
+    split and asserting past feature values are unchanged. (§8.5, §5)
+14. **Models: HistGradientBoosting is primary, RandomForest is a required control.** If
+    RF matches or beats HGB on the holdout, HGB is overfit — report both, always. Keep
+    the depth-4 tree permanently as the readable baseline. Shallow and heavily
+    regularized: `max_depth=3`, `learning_rate=0.03`, `min_samples_leaf≈100`, early
+    stopping on. CatBoost has no cp315 wheel; do not add it. (§10.1)
 13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
     `min_liquidity` and the gap filter run at sample-construction time too — otherwise
     you train on regimes you will never trade in (e.g. March 2020 at 10x leverage).
     (§10.1)
+
+## 3a. Chart before you train
+
+`tdm chart` (§7) is build phase 3 — **before** labels and training. Two rules:
+
+- **`report/` reads the feature matrix; it never computes an indicator.** A chart that
+  draws its own indicators can look perfect while the model trains on garbage, and when
+  a value looks wrong you cannot tell whether the bug is in the pipeline or the plot.
+- Use **Plotly** (`go.Candlestick` + `make_subplots` + `write_html`). Self-contained
+  interactive HTML, no server, no build step.
+
+Visual checks catch what unit tests miss: off-by-one indicators, hindsight ZigZag pivots,
+warm-up periods filled with 0 instead of NaN, features that are flat for 200 bars.
 
 ## 4. pandas 3.x gotchas
 
@@ -127,11 +136,19 @@ projects (including `~/code/stock-market-entry-signal-tpsl-specific`) will likel
 - `inplace=True` now returns `self` instead of `None`.
 - String columns infer to the new `str` dtype, not `object`.
 
-Also: **`pandas-ta` cannot be installed on Python 3.15** (it pins `numba==0.61.2`, which
-has no cp315 wheel), and **`vectorbt` declares `requires-python <3.15`**. Use `TA-Lib`
-for indicators and the in-repo `backtest/engine.py`. Don't add either package.
+Packages that **cannot** be installed on Python 3.15 — don't try:
+
+| Package | Why |
+|---|---|
+| `pandas-ta` | pins `numba==0.61.2`, no cp315 wheel. Use **TA-Lib**. |
+| `vectorbt` | declares `requires-python <3.15`. Use the in-repo `backtest/engine.py`. |
+| `catboost` | wheels stop at cp314. Use `HistGradientBoostingClassifier`. |
 
 ## 5. Don't commit data
 
-`data/`, `models/`, `reports/`, `*.db`, `*.parquet` are gitignored and must stay that
-way. All of it is re-derivable from `make fetch` onward.
+`data/`, `models/`, `reports/`, `*.parquet`, `runs.jsonl` are gitignored and must stay
+that way. All of it is re-derivable from `make fetch` onward.
+
+**One exception worth knowing:** `decisions.jsonl` (§13) is the log of calls the system
+actually issued, and it is the only genuinely out-of-sample record that will ever exist.
+It is still gitignored, but never delete or regenerate it.
