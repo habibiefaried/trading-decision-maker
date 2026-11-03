@@ -73,8 +73,8 @@ make label                                    # triple-barrier labels
 ./venv/bin/python -m tdm.cli dataset schema    # column list, dtypes, CORE/EXT tier
 ```
 
-The dataset is one row per `(symbol, date)`: identity, raw OHLCV, ~41 feature columns,
-`y_*` target columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §9.0.
+The dataset is one row per `(symbol, date)`: identity, raw OHLCV, ~40 feature columns,
+`y_*` target columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §8.1.
 
 ### Charts
 
