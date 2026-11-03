@@ -64,6 +64,10 @@ Each of these has burned this class of project before. DESIGN.md explains why.
 1. **Never store adjusted prices.** `bar_daily` holds raw, unadjusted OHLCV; adjustment
    is applied at read time from `corporate_action`. Splits rewrite adjusted history
    retroactively, so a cache of adjusted closes goes silently stale. (§6)
+   **Corollary — the feature store is append-only.** Because every feature is scale-free
+   (rule 12), corporate actions cannot change a past feature value. A new split means
+   compute *forward*; never invalidate or recompute history. The only recompute triggers
+   are a `revision` bump on an old bar, or a late-discovered past action. (§6.1)
 2. **Never fetch a date range already covered.** Go through `ingest/sync.py`, which
    consults `fetch_coverage` and `known_gap`. Fetching twice is the bug this repo
    exists to avoid. (§7)
@@ -93,6 +97,16 @@ Each of these has burned this class of project before. DESIGN.md explains why.
 11. **No weekly resampling.** Dropped by decision. For a longer-timeframe trend signal,
     use a wider ZigZag threshold on daily bars (`dow_trend_major`), which avoids the
     partial-bar leakage hazard entirely. (§8.2, §8.4)
+12. **Every feature must be scale-free** — a ratio, a bounded oscillator, or a trailing
+    z-score/percentile. Never raw dollars (price, EMA, MACD, band levels) and never an
+    unbounded cumulative sum (OBV). This has two independent payoffs: tree thresholds
+    transfer across tickers, and features become invariant to splits and dividends.
+    `tests/test_invariance.py` enforces it by injecting a synthetic split and asserting
+    past feature values are unchanged. (§8.5, §6.1)
+13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
+    `min_liquidity` and the gap filter run at sample-construction time too — otherwise
+    you train on regimes you will never trade in (e.g. March 2020 at 10x leverage).
+    (§10.1)
 
 ## 4. pandas 3.x gotchas
 

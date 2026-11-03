@@ -40,9 +40,11 @@ a durable transactional store; stages 2–4 are disposable and get recomputed fr
 
 Worth stating up front, because they drive most of the design decisions:
 
-1. **The upstream data is retroactively mutable.** Rows you fetched last year can change
-   meaning this year (§6). This is a cache-invalidation problem, and it's why the schema
-   looks the way it does.
+1. **The upstream data looks retroactively mutable.** The *adjusted* prices a provider
+   hands you are a function of the present, not a fact about the past — a split rewrites
+   all of them (§6). Store the raw bars instead and the problem dissolves: raw OHLCV for
+   a given date is immutable, and §6.1 shows the derived features are too. It's why the
+   schema looks the way it does.
 2. **The correctness bug you cannot see.** The whole system predicts the future from the
    past. If any code path accidentally lets future data reach the model, everything still
    runs, all tests pass, metrics look *great*, and the system is worthless. There's no
@@ -310,6 +312,7 @@ trading-decision-maker/
 ├── tests/
 │   ├── test_indicators.py       # vs TA-Lib / hand-computed fixtures
 │   ├── test_leakage.py          # ← the most important tests in the repo (§10.5)
+│   ├── test_invariance.py       # inject a split, assert past features unchanged (§6.1)
 │   ├── test_triple_barrier.py
 │   └── test_incremental_fetch.py
 │
@@ -361,7 +364,7 @@ this layout exists to fix:
 | Corporate actions | **SQLite** | Small, critical, same reason |
 | Provenance / run metadata | **SQLite** | Relational, queried ad hoc |
 | Issued decisions + outcomes | **SQLite** | Append-only audit log |
-| Feature matrix | **Parquet** | Wide, numeric, recomputable in seconds. See the trade-off table below. |
+| Feature matrix | **Parquet** | Wide, numeric, and **append-only — a row once written is correct forever** (§6.1). See the trade-off table below. |
 | Labels | **Parquet** | Same |
 | Exports for Excel | **CSV** | On demand only |
 
@@ -556,7 +559,7 @@ CREATE TABLE decision_outcome (
 
 ---
 
-## 6. The cache-invalidation problem: store raw, adjust on read
+## 6. Store raw, adjust on read — and why nothing ever needs invalidating
 
 This is the single most important schema decision, and it's a pure engineering problem —
 no finance knowledge needed to see why.
@@ -617,6 +620,70 @@ needs.
 > historical share counts must be **multiplied** by 10 while prices are divided by 10.
 > `tests/test_indicators.py` should pin this against a real split — NVDA's 10:1 on
 > 2024-06-10 is a good fixture.
+
+### 6.1 The derived features never need invalidating either
+
+Storing `(date, OHLCV)` as immutable rows is the right instinct, and it extends further
+than it first appears: **the computed indicator values are also permanent.** Worth proving
+rather than asserting, because it removes a whole category of work.
+
+**The claim.** Compute the feature matrix today. Tomorrow NVDA splits 10:1. Do any of
+yesterday's feature values change?
+
+**No — and here's why.** A corporate action rescales prices **multiplicatively**: every
+adjusted price before the action gets multiplied by the same constant `k`. And every
+feature in §8.5 is a **ratio**. So the `k` cancels:
+
+| Feature | Under a rescale by `k` | Result |
+|---|---|---|
+| `close/EMA200 − 1` | `(k·C)/(k·EMA200) − 1` | **invariant** |
+| `ATR/close` | `(k·ATR)/(k·C)` | **invariant** |
+| `%B` = `(C−lo)/(hi−lo)` | all three scale by `k` | **invariant** |
+| `MACD/ATR` | both scale by `k` | **invariant** |
+| RSI, Stochastic, ADX | built from price *ratios* | **invariant** |
+| `volume/median_volume` | both scale by `1/k` | **invariant** |
+| OBV slope, z-scored | scales by `1/k`, z-score normalizes it | **invariant** |
+
+> **The §8.5 normalization rule was adopted so a decision tree's thresholds would transfer
+> across tickers. It turns out to buy immutability for free.** Scale-free and
+> corporate-action-invariant are the same property. That's a genuinely convenient
+> coincidence, and it's the reason your framing works.
+
+**What this means concretely:**
+
+- **A new split or dividend never invalidates a single historical feature row.** When one
+  arrives, you compute *forward* from that date. You never recompute history.
+- Since corporate actions only ever happen in the present, that forward computation is
+  the same incremental tail update you'd be doing anyway (§7). **So the cost of a split is
+  zero.**
+- The feature store can therefore be treated as **append-only**, keyed by
+  `(symbol, date, feature_set_hash)`. A row, once written, is correct forever.
+
+**Two narrow exceptions** — both are "recompute a bounded window", not an invalidation
+protocol:
+
+| Exception | Why | Scope of recompute |
+|---|---|---|
+| The provider **restates an old bar** (§7 — `revision` bumps) | The raw input genuinely changed, so it wasn't a fact after all | from that bar forward, by the longest feature warm-up (~200 bars) |
+| A **past** corporate action is discovered late | Rescaling only applies *before* the action date, so it introduces a step at that date; features whose lookback window spans it do change | a window around the action date |
+
+Both are rare, both are detectable (`revision`, and comparing `corporate_action` row
+counts after a fetch), and both are handled by recomputing a window rather than by
+tracking staleness.
+
+> **This is the test that proves it, and it belongs in the suite:**
+> `tests/test_invariance.py` — take a real series, inject a synthetic 10:1 split at a
+> chosen date, recompute all features, and **assert every feature value before that date
+> is bit-identical.** Any feature that fails this test is not scale-free, which means it's
+> also broken for §8.5's original reason. One assertion catches both bugs.
+
+**The one thing this does *not* let us skip: the adjustment itself.** Computing indicators
+directly on raw prices across a split is still wrong — a 10:1 split injects one fake −90%
+return, which corrupts every window-based indicator for the length of its lookback (14
+bars for RSI, **200 bars for EMA200**). The feature *is* deterministic, so it's stable
+forever, but it's stably wrong. Raw prices are the right thing to *store*; the continuous
+series is the right thing to *compute on*. That's why `corporate_action` and
+`read_bars(adjust=True)` stay.
 
 ---
 
