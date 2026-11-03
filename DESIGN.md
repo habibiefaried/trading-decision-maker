@@ -1,297 +1,396 @@
 # Trading Decision Maker — Design
 
-**Status:** design only, no code yet. Review this before implementation starts.
+**Status:** design only, no code yet.
+**Audience:** software engineers. No finance background assumed — §2 is a glossary that
+defines every domain term used in this document, in programming terms.
 **Date:** 2026-11-03
-**Author:** design drafted with Claude Code, to be reviewed by Habibie Faried
 
 ---
 
-## 0. What this system is (and is not)
+## 1. What the system does
 
-**Goal.** Once a day, after the US close, answer one question per ticker:
-
-> Given today's data, should I open a **LONG**, open a **SHORT**, or do **NOTHING** —
-> and if I trade, where exactly do I put the take-profit and the stop-loss?
-
-Output is a short table plus the reasoning, e.g.:
+A batch pipeline that runs once a day. Input: daily price history for a list of stock
+tickers. Output: one row per ticker telling you to buy, sell-short, or do nothing, plus
+the two price levels at which you'd exit.
 
 ```
-NVDA   LONG    conf 0.71   entry 183.40   TP 196.10 (+6.9%)   SL 177.05 (-3.5%)   R:R 2.0   hold <= 10d
-       because: EMA21 slope +0.8σ, ADX 31 (trending), RSI 58, %B 0.74, RS-vs-SPY 94th pct
-AMD    HOLD    conf 0.48   — no edge: ADX 14 (chop), earnings in 3 days
-TSLA   SHORT   conf 0.66   entry 402.10   TP 377.90 (-6.0%)   SL 414.20 (+3.0%)   R:R 2.0   hold <= 10d
+$ make daily
+
+NVDA   LONG    conf 0.71   entry 183.40   TP 196.10 (+6.9%)   SL 177.05 (-3.5%)   hold <= 10d
+AMD    HOLD    conf 0.48   — no edge: ADX 14 (choppy), earnings in 3 days
+TSLA   SHORT   conf 0.66   entry 402.10   TP 377.90 (-6.0%)   SL 414.20 (+3.0%)   hold <= 10d
 ```
 
-**This is a research and decision-support tool.** It is not a money printer and it is
-not an auto-trader. It does not place orders. A realistic, honest expectation is laid
-out in §11 — read that section before you judge the model's numbers, because the
-single most common way a project like this fails is a beautiful backtest built on
-leakage.
+Read that as: *"bet NVDA goes up. Exit with profit at 196.10, or cut the loss at 177.05,
+whichever happens first. Give up after 10 days either way."*
 
-### Scope decisions (locked in)
+### As a system, it's four stages
 
-| Decision | Choice | Why |
-|---|---|---|
-| Market | **US stocks & ETFs**, daily bars, via yfinance | Free, deep history, matches the previous repo's universe |
-| Horizon | **1–10 trading days** (swing) | You check once a day; enough signal-to-noise for ML, unlike next-day |
-| TP/SL definition | **ATR-multiples** (volatility-scaled) | Adapts per ticker and per regime; NVDA and KO need different absolute stops |
-| Timeframes | **Daily primary, weekly as confirmation features** | Weekly trend as a filter is the cheapest real edge in swing trading |
-| Python | **3.15** | Explicit requirement; verified viable in §1 |
-| Model | **Decision tree as the readable baseline, gradient boosting as the workhorse** | See §9 |
-
----
-
-## 1. Runtime & environment
-
-### Python 3.15 — verified viable
-
-I checked this rather than assuming it, because a brand-new Python usually means
-missing wheels in the scientific stack. As of today:
-
-| Package | Latest | `cp315` wheel? | Notes |
+| Stage | What it is, in engineering terms | Cost to run | Idempotent? |
 |---|---|---|---|
-| numpy | 2.5.4 | ✅ | |
-| pandas | 3.1.0 | ✅ | **Major version — breaking changes, see below** |
-| scikit-learn | 1.9.1 | ✅ | |
-| TA-Lib (`ta-lib`) | 0.8.3 | ✅ | Wheels are self-contained; no `brew install ta-lib` needed |
-| matplotlib | 3.11.2 | ✅ | |
-| pyarrow | 26.0.1 | ✅ | |
-| xgboost | 3.4.1 | ✅ (pure-py wheel, `requires-python >=3.12`) | |
-| shap | 0.54.1 | ✅ | optional, for explaining the boosted model |
-| yfinance | 1.7.0 | ✅ (pure-py) | |
-| exchange-calendars | 4.13.2 | ✅ (pure-py) | NYSE session calendar |
+| **1. Ingest** | Pull rows from a flaky, rate-limited third-party HTTP API into local SQLite | **Expensive** (network, rate limits) | Yes — and must *skip* work already done |
+| **2. Features** | `map` a few hundred pure functions over a time series to build a wide numeric matrix | Cheap (seconds) | Yes — pure, fully recomputable |
+| **3. Train** | Generate labels by simulation, then fit a classifier | Minutes | Yes, given a fixed seed |
+| **4. Decide** | Load model, run inference on today's row, write output | Milliseconds | Yes |
 
-**Two things are ruled out by the 3.15 choice.** Both are worth knowing up front so
-nobody wastes an afternoon on them:
+The architecture follows from that cost asymmetry: **stage 1 output is precious and gets
+a durable transactional store; stages 2–4 are disposable and get recomputed freely.**
 
-- **`pandas-ta` cannot be used.** It hard-pins `numba==0.61.2`, and numba 0.61.2 only
-  publishes wheels up to `cp313`. It will not install on 3.15 at all. → We use
-  **TA-Lib** as the indicator engine instead, which is faster anyway (Cython, 2–4×
-  the old SWIG bindings) and has cp315 wheels.
-- **`vectorbt` cannot be used.** It declares `requires-python <3.15`. → We write our
-  own small walk-forward evaluator (§10), which we want regardless, because the
-  triple-barrier labeling in §8 already encodes the exit logic and a general-purpose
-  backtester would just be a second, disagreeing implementation of it.
+### Three things make this harder than a normal ETL pipeline
 
-**pandas 3.x is a breaking release.** The changes that will actually bite this project:
+Worth stating up front, because they drive most of the design decisions:
 
-1. **Copy-on-Write is now mandatory.** Chained assignment (`df['x'][0] = v`) silently
-   does nothing or raises. All indicator code must assign via `df.loc[...]` or build
-   new columns functionally. This is strictly good for us but it will break any code
-   copy-pasted from the old repo.
-2. **Default datetime resolution is microsecond, not nanosecond.** `pd.to_datetime([0], unit="s")`
-   now yields `datetime64[s]`. Anything that assumed `ns` and did integer math on
-   timestamps is now wrong by a factor of 1000. We sidestep this by storing dates as
-   ISO `TEXT` in SQLite and parsing explicitly.
-3. **Offset aliases `M`, `Q`, `Y` were removed** — must use `ME`, `QE`, `YE`. Weekly
-   resampling (`W-FRI`) is unaffected, which is what we mainly need.
-4. **`inplace=True` now returns `self`** instead of `None`.
-5. **String columns infer to the new `str` dtype**, not `object`.
+1. **The upstream data is retroactively mutable.** Rows you fetched last year can change
+   meaning this year (§6). This is a cache-invalidation problem, and it's why the schema
+   looks the way it does.
+2. **The correctness bug you cannot see.** The whole system predicts the future from the
+   past. If any code path accidentally lets future data reach the model, everything still
+   runs, all tests pass, metrics look *great*, and the system is worthless. There's no
+   stack trace. §10 is entirely about this, and it's the most important section here.
+3. **Two implementations of the same logic must agree.** The training labels are produced
+   by a simulator, and production inference runs a separate code path. If they drift,
+   you've trained on a world that doesn't match the one you deploy into (§9, §11).
 
-> **Risk to watch:** `yfinance` declares only `pandas>=1.3.0` with no upper bound, so
-> pip will happily install it alongside pandas 3.1 — but that does not mean it has been
-> tested there. **The ingest path is the first thing to smoke-test.** If it breaks,
-> the fallback is pinning `pandas>=2.3,<3` (which still has cp315 wheels for 2.3.x? —
-> verify at the time) or vendoring a thin Yahoo client. Do not discover this in week 3.
+### Scope (locked in with the user)
 
-### venv — mandatory, enforced three ways
+| Decision | Choice |
+|---|---|
+| What we trade | US stocks & ETFs |
+| Data source | `yfinance` (free Yahoo Finance API wrapper) |
+| Granularity | One row per trading day |
+| How long we hold | 1–10 trading days |
+| Can we bet on prices falling? | **Yes** (confirmed) — so both directions are modeled (§11.1) |
+| Python | 3.15 |
 
-Every command in this repo runs inside `./venv`. This is enforced redundantly so that
-a future agent (or a future you, six months from now) cannot get it wrong:
+---
 
-1. **`.python-version`** → `3.15` (pyenv/uv read this).
-2. **`CLAUDE.md`** → an explicit, unmissable instruction block at the top of the file.
-3. **A runtime guard in `src/tdm/__init__.py`.** If `sys.prefix == sys.base_prefix`,
-   raise immediately with a message telling the caller to activate the venv. An agent
-   that forgets gets a loud, self-explaining error on the first call rather than
-   mysteriously polluting the system Python.
+## 2. Glossary
 
-Bootstrap:
+Every domain term in this document, defined once. Skim it now, refer back as needed.
+
+### The data
+
+| Term | Meaning |
+|---|---|
+| **Ticker** / **symbol** | A string ID for a stock: `"NVDA"`, `"AAPL"`. The primary key of this whole system. |
+| **Bar** | One row of data for one ticker for one time period. Our bars are daily. |
+| **OHLCV** | The 5 numbers in a bar: **O**pen (first trade price of the day), **H**igh, **L**ow, **C**lose (last trade price), **V**olume (number of shares traded). That's the entire raw input. |
+| **Session** | One trading day. The US market is open ~6.5h/day, weekdays, minus ~10 holidays/year. So "yesterday" and "the previous session" are different things, and you need a calendar library to know which. |
+| **ETF** | A ticker that represents a basket of stocks. `SPY` tracks the 500 largest US companies, so it's a convenient one-number proxy for "the market". |
+| **ADV** | Average Daily Volume. How much the stock trades. Low ADV = you can't buy or sell without moving the price yourself. |
+
+### The actions
+
+| Term | Meaning |
+|---|---|
+| **Long** | Buy now, hoping to sell higher later. The normal direction. You profit if price goes **up**. |
+| **Short** | Borrow shares, sell them now, buy them back later to return them. You profit if price goes **down**. Requires a special account type and has extra costs/rules (§11.1). |
+| **Flat** / **HOLD** | No position. Doing nothing. This is a valid and frequently correct output. |
+| **Entry** | The price at which you open a position. |
+| **TP** (take-profit) | A pre-set price where you close the position at a **profit**. In practice it's a standing order with the broker: "sell automatically if it reaches this." |
+| **SL** (stop-loss) | A pre-set price where you close at a **loss**, to stop it getting worse. Also a standing order. |
+| **Position sizing** | How many shares to buy. A separate decision from direction, and arguably more important. |
+
+### Measuring things
+
+| Term | Meaning |
+|---|---|
+| **Indicator** | A pure function over a window of past bars, returning one number per bar. `f: List[Bar] -> float`. That's all any of them are, including the ones with mystical names. §8 lists ~40. |
+| **SMA / EMA** | Simple / Exponential Moving Average over N days. `EMA` weights recent days more. A low-pass filter on a noisy signal. |
+| **ATR** (Average True Range) | **The most important one for us.** Roughly: the average distance between a day's high and low, over the last 14 days. It's a volatility measure in dollars. A $500 stock might have ATR=$12; a $20 stock might have ATR=$0.40. <br><br>We use ATR as a **unit of distance**, like using standard deviations instead of raw values. "Set the stop 1 ATR away" means "1 typical day's movement away", which is automatically the right size for both of those stocks. This is how the system stays comparable across tickers. |
+| **Oscillator** | An indicator bounded to a fixed range (usually 0–100), measuring "how overextended is the recent move". RSI, Stochastic, MFI, CCI are all variations. Convenient because they're already normalized. |
+| **Trend indicator** | Measures direction and/or strength of a sustained move. EMA slope, ADX, Aroon, Supertrend. |
+| **Volatility indicator** | Measures how much the price is bouncing around. ATR, Bollinger Band width, Keltner. |
+| **Volume indicator** | Combines price with trade volume. OBV, MFI, VWAP. The theory is that a price move backed by high volume is more meaningful. |
+
+### Evaluating results
+
+| Term | Meaning |
+|---|---|
+| **Return** | Percentage change. `(exit - entry) / entry`. |
+| **R:R** (reward-to-risk) | Ratio of TP distance to SL distance. If TP is 2 ATR away and SL is 1 ATR away, R:R = 2.0. You win twice as much as you lose, per event. |
+| **Hit rate** | Fraction of trades that hit TP instead of SL. **Analogous to precision, not accuracy.** |
+| **Expectancy** | `p_win × avg_win − p_loss × avg_loss`. Expected value per trade. **This is the actual objective function.** Note the implication of R:R 2.0: you break even at a **33% hit rate**, so "67% of predictions wrong" is still profitable here. Accuracy is close to meaningless as a metric (§10.4). |
+| **Base rate** | The unconditional fraction of positive labels in the dataset. Your baseline to beat. |
+| **Drawdown** | Peak-to-trough decline in account value. Max drawdown is "the worst stretch you'd have had to sit through". |
+| **Backtest** | A replay/simulation harness: run the strategy over historical data and see what would have happened. Trivially easy to get wrong in ways that flatter you (§12). |
+| **Slippage** | The gap between the price you expected and the price you got. Real-world execution noise. |
+
+### The hazards
+
+| Term | Meaning |
+|---|---|
+| **Lookahead** / **leakage** | A bug where information from the future reaches a calculation that's supposed to only see the past. **The central correctness risk in this project.** Closest analogy: a test that passes because it reads the expected value out of the same fixture it's asserting against — green, meaningless. See §10. |
+| **Survivorship bias** | Selection bias in the ticker list. If you pick today's famous companies, you picked them *because* they went up. Your backtest then "discovers" that buying stocks works. |
+| **Overfitting** | Standard ML meaning. Acute here because the signal-to-noise ratio is genuinely terrible and the effective sample size is much smaller than the row count (§9). |
+| **Corporate action** | An event that changes the share structure: a **split** (1 share becomes 10, price divides by 10, your holdings are worth the same) or a **dividend** (company pays out cash). These rewrite historical price series — see §6. |
+| **Adjusted price** | A historical price retroactively modified to account for all splits/dividends since. The subject of the most important schema decision in this document (§6). |
+| **Earnings** | A quarterly scheduled event where a company reports results. The price frequently jumps 5–15% overnight. Scheduled, known in advance, and the most common way a position blows through its stop-loss before you can react. So: a hard precondition check, not a feature to be learned (§13). |
+
+### Things we deliberately avoid
+
+| Term | Why it's here |
+|---|---|
+| **Elliott Wave**, **Dow Theory** | Two traditional chart-reading frameworks that the user asked for. They are **not formulas** — they're interpretive, and practitioners disagree on how to apply them to the same chart. §8.4 extracts measurable features from the underlying idea rather than pretending to implement them. |
+| **VWAP** | Volume Weighted Average Price. The user asked for it, but the standard definition is *intraday* and mathematically degenerates to nothing useful on daily bars. §8.1 explains and substitutes a working variant. |
+
+---
+
+## 3. Environment: Python 3.15 + venv
+
+### Verified package availability
+
+A brand-new Python usually means missing binary wheels in the scientific stack, so I
+checked PyPI wheel tags rather than assuming:
+
+| Package | Version | `cp315` wheel | Role |
+|---|---|---|---|
+| numpy | 2.5.4 | ✅ | arrays |
+| pandas | 3.1.0 | ✅ | dataframes — **major version, breaking, see below** |
+| scikit-learn | 1.9.1 | ✅ | models, CV |
+| TA-Lib (`ta-lib`) | 0.8.3 | ✅ | indicator library (C, Cython-wrapped). Wheels are self-contained — no `brew install ta-lib` |
+| pyarrow | 26.0.1 | ✅ | Parquet I/O |
+| matplotlib | 3.11.2 | ✅ | plots |
+| yfinance | 1.7.0 | ✅ (pure-py) | data source |
+| exchange-calendars | 4.13.2 | ✅ (pure-py) | which days the market is open |
+| xgboost | 3.4.1 | ✅ | optional alternative model |
+| shap | 0.54.1 | ✅ | optional model explanation |
+
+### Two popular packages are ruled out by Python 3.15
+
+Both would be natural choices; neither can be installed. Worth knowing before someone
+spends an afternoon on it:
+
+- **`pandas-ta`** (a popular pure-Python indicator library) **cannot install at all.** It
+  hard-pins `numba==0.61.2`, and that numba version publishes wheels only up to `cp313`.
+  → **Use TA-Lib**, which is faster anyway.
+- **`vectorbt`** (a backtesting framework) declares `requires-python <3.15`.
+  → **Write our own** (§12). We'd want to regardless — see the "two implementations must
+  agree" problem in §1, which a third-party framework would make worse, not better.
+
+### pandas 3.x is a breaking release
+
+Code copied from the user's previous project (which used pandas 2.x) will break:
+
+| Change | Impact |
+|---|---|
+| **Copy-on-Write is mandatory** | Chained assignment `df['x'][0] = v` silently does nothing or raises. Use `df.loc[...]`, or build columns functionally. Strictly an improvement, but it *will* break old code. |
+| **Default datetime resolution is microsecond**, not nanosecond | Any integer arithmetic on timestamps is now off by 1000×. We avoid this entirely by storing dates as ISO `TEXT` (§5). |
+| **Offset aliases `M`/`Q`/`Y` removed** | Use `ME`/`QE`/`YE`. (`W-FRI`, which we need for weekly resampling, is unaffected.) |
+| **`inplace=True` returns `self`** | Previously `None`. |
+| **String columns infer to `str` dtype**, not `object` | |
+
+> ⚠️ **Unverified risk — test this first.** `yfinance` declares only `pandas>=1.3.0` with
+> no upper bound, so pip will happily install it next to pandas 3.1. That is not the same
+> as it *working* there. **Smoke-test the ingest path in phase 1** (§14). If it breaks,
+> fall back to pinning `pandas>=2.3,<3`. Do not discover this in week three.
+
+### venv, enforced three ways
+
+Everything runs in `./venv`. Enforced redundantly, because on this machine bare `python3`
+is pyenv 3.13.1 and `/opt/homebrew/bin/python3` is 3.14 — both wrong:
+
+1. **`.python-version`** → `3.15`
+2. **`CLAUDE.md`** → explicit instructions for AI agents working in the repo
+3. **A runtime guard** in `src/tdm/__init__.py`:
+
+```python
+import sys
+if sys.prefix == sys.base_prefix:
+    raise RuntimeError(
+        "not running inside ./venv — use ./venv/bin/python or `make`"
+    )
+```
+
+That guard is the one that actually works. The other two are documentation; this one
+fails loudly at import time.
+
+> **Note for AI agents and shell scripts:** do *not* use `source venv/bin/activate` in a
+> tool call. Shell state doesn't persist between calls, so activation is gone by the next
+> command and you silently run on system Python. Always use the explicit path.
+
+Setup:
 
 ```bash
-brew install python@3.15                  # verified available: 3.15.2
+brew install python@3.15                  # provides 3.15.2
 /opt/homebrew/bin/python3.15 -m venv venv
 ./venv/bin/python -m pip install -U pip
 ./venv/bin/pip install -r requirements.txt
 ```
 
-`uv venv --python 3.15` also works, but note your local `uv` (0.11.7, built 2026-04)
-only knows about `3.15.0a8`; run `uv self update` first if you want that path.
-
-A `Makefile` wraps everything so no one has to remember the venv path:
+A `Makefile` wraps every command so the venv path is never typed by hand:
 
 ```make
 PY := ./venv/bin/python
-venv:      ## create venv and install deps
-fetch:     ## $(PY) -m tdm.cli fetch --universe config/universe.txt
-features:  ## $(PY) -m tdm.cli features build
-label:     ## $(PY) -m tdm.cli labels build
-train:     ## $(PY) -m tdm.cli train
-backtest:  ## $(PY) -m tdm.cli backtest
-decide:    ## $(PY) -m tdm.cli decide --date today
-daily:     ## fetch -> features -> decide   (the once-a-day command)
+
+venv:       # create venv + install
+fetch:      # $(PY) -m tdm.cli fetch
+features:   # $(PY) -m tdm.cli features build
+label:      # $(PY) -m tdm.cli labels build
+train:      # $(PY) -m tdm.cli train
+backtest:   # $(PY) -m tdm.cli backtest
+decide:     # $(PY) -m tdm.cli decide --date today
+daily:      # fetch -> features -> decide   (the once-a-day command)
 test lint
 ```
 
 ---
 
-## 2. Repository layout
+## 4. Repository layout
 
 ```
 trading-decision-maker/
-├── .python-version                 # 3.15
-├── CLAUDE.md                       # agent rules: ALWAYS ./venv, never system python
-├── DESIGN.md                       # this file — the "why"
-├── README.md                       # the "how to run" only
+├── .python-version              # 3.15
+├── CLAUDE.md                    # rules for AI agents working here
+├── DESIGN.md                    # this file — the "why"
+├── README.md                    # the "how to run" only
 ├── Makefile
 ├── pyproject.toml
-├── requirements.txt                # loose constraints
-├── requirements.lock.txt           # pip freeze, committed, for reproducibility
-├── .gitignore                      # venv/, data/, models/, reports/, *.db
+├── requirements.txt             # loose constraints
+├── requirements.lock.txt        # pip freeze, committed, for reproducibility
 │
 ├── config/
-│   ├── universe.txt                # one ticker per line
-│   ├── config.toml                 # horizons, ATR multiples, costs, thresholds
+│   ├── universe.txt             # tickers, one per line
+│   ├── config.toml              # horizons, ATR multiples, costs, thresholds
 │   └── feature_sets/
-│       ├── baseline.toml           # the user-requested indicator list
-│       └── extended.toml           # + the additions recommended in §7
+│       ├── baseline.toml
+│       └── extended.toml
 │
 ├── src/tdm/
-│   ├── __init__.py                 # venv guard
-│   ├── cli.py                      # single entrypoint, subcommands
-│   ├── config.py                   # pydantic-settings; config hashing
+│   ├── __init__.py              # venv guard
+│   ├── cli.py                   # single entrypoint, subcommands
+│   ├── config.py                # pydantic-settings + config hashing
 │   │
-│   ├── store/
-│   │   ├── schema.sql              # §4
-│   │   ├── migrations/             # 001_init.sql, 002_... (forward-only)
-│   │   ├── db.py                   # connection, pragmas, migration runner
-│   │   └── bars.py                 # upsert_bars, read_bars, coverage queries
+│   ├── store/                   # ── persistence layer
+│   │   ├── schema.sql           #    §5
+│   │   ├── migrations/          #    001_init.sql, ... forward-only
+│   │   ├── db.py                #    connection, pragmas, migration runner
+│   │   └── bars.py              #    upsert_bars / read_bars / coverage queries
 │   │
-│   ├── ingest/
-│   │   ├── provider.py             # Provider protocol (so ccxt/IDX can slot in later)
-│   │   ├── yahoo.py                # yfinance adapter
-│   │   ├── sessions.py             # exchange_calendars NYSE wrapper
-│   │   └── sync.py                 # §5 incremental-fetch planner
+│   ├── ingest/                  # ── the only module that touches the network
+│   │   ├── provider.py          #    Provider protocol (§7)
+│   │   ├── yahoo.py             #    yfinance implementation
+│   │   ├── sessions.py          #    market-calendar wrapper
+│   │   └── sync.py              #    incremental fetch planner (§7)
 │   │
-│   ├── features/
-│   │   ├── registry.py             # name -> fn, declared warm-up, declared deps
-│   │   ├── trend.py                # EMA21 stack, ADX/DI, Aroon, Supertrend, Ichimoku
-│   │   ├── momentum.py             # RSI, MACD, Stoch, ROC/MOM, CCI
-│   │   ├── volatility.py           # ATR, Bollinger, Keltner, Donchian
-│   │   ├── volume.py               # OBV, MFI, A/D, rolling & anchored VWAP
-│   │   ├── structure.py            # ZigZag pivots -> Dow Theory, Elliott/Fib  (§7.4)
-│   │   ├── market.py               # relative strength vs SPY, regime, breadth
-│   │   ├── calendar_feats.py       # day-of-week, days-to-earnings, gap features
-│   │   └── pipeline.py             # orchestrate, normalize, write Parquet
+│   ├── features/                # ── pure functions, no I/O
+│   │   ├── registry.py          #    name -> fn + declared warmup + deps
+│   │   ├── trend.py             #    EMA stack, ADX, Aroon, Supertrend, Ichimoku
+│   │   ├── momentum.py          #    RSI, MACD, Stochastic, ROC, CCI
+│   │   ├── volatility.py        #    ATR, Bollinger, Keltner, Donchian
+│   │   ├── volume.py            #    OBV, MFI, VWAP variants
+│   │   ├── structure.py         #    ZigZag pivots -> Dow/Elliott features (§8.4)
+│   │   ├── market.py            #    relative strength vs SPY, market regime
+│   │   ├── calendar_feats.py    #    day-of-week, days-to-earnings, gaps
+│   │   └── pipeline.py          #    orchestrate, normalize, write Parquet
 │   │
 │   ├── labels/
-│   │   └── triple_barrier.py       # §8
+│   │   └── triple_barrier.py    #    the simulator that generates y (§9)
 │   │
 │   ├── model/
-│   │   ├── dataset.py              # join features+labels, split, sample weights
-│   │   ├── cv.py                   # PurgedWalkForwardSplit  (§9.3)
+│   │   ├── dataset.py           #    join features+labels, sample weights
+│   │   ├── cv.py                #    PurgedWalkForwardSplit (§10.3)
 │   │   ├── train.py
-│   │   ├── explain.py              # tree rules export, SHAP, permutation importance
-│   │   └── registry.py             # model artifacts + provenance
+│   │   ├── explain.py           #    rule export, permutation importance, SHAP
+│   │   └── registry.py          #    artifacts + provenance
 │   │
 │   ├── backtest/
-│   │   └── engine.py               # §10
+│   │   └── engine.py            #    §12
 │   │
-│   └── decide.py                   # §12 — the daily output
+│   └── decide.py                #    §13 — production inference path
 │
-├── scripts/
-│   └── bootstrap.sh
+├── scripts/bootstrap.sh
 ├── tests/
-│   ├── test_indicators.py          # vs TA-Lib / hand-computed fixtures
-│   ├── test_leakage.py             # §9.5 — the most important tests in the repo
+│   ├── test_indicators.py       # vs TA-Lib / hand-computed fixtures
+│   ├── test_leakage.py          # ← the most important tests in the repo (§10.5)
 │   ├── test_triple_barrier.py
 │   └── test_incremental_fetch.py
 │
-└── data/                           # GITIGNORED
-    ├── market.db                   # SQLite: bars, actions, metadata, runs
-    ├── features/                   # Parquet, one file per (feature_set, run)
-    ├── labels/                     # Parquet
-    └── exports/                    # CSV, for eyeballing in Excel
-└── models/                         # GITIGNORED — trained artifacts
-└── reports/                        # GITIGNORED — daily decisions, backtest plots
+├── data/                        # GITIGNORED
+│   ├── market.db                #   SQLite: bars, actions, metadata, provenance
+│   ├── features/                #   Parquet
+│   ├── labels/                  #   Parquet
+│   └── exports/                 #   CSV, for eyeballing in Excel
+├── models/                      # GITIGNORED
+└── reports/                     # GITIGNORED
 ```
 
-### Why this split and not one big `train.py`
+### Layering rule
 
-The previous repo (`stock-market-entry-signal-tpsl-specific`) had a 52 KB
-`fetch_stock_data.py` and a 44 KB `train.py`, with per-day CSVs like
-`AAPL_tpsl_data_20260610.csv` accumulating in `data/`. That layout has two specific
-failure modes this design is built to avoid:
+```
+cli  ->  decide / train / backtest  ->  features / labels  ->  store  ->  ingest
+```
 
-1. **No cache** — every run re-downloads, so you rate-limit yourself and can't iterate.
-2. **No provenance** — given `models/xyz.pkl` you cannot reconstruct which features,
-   which labeling parameters, or which date range produced it. So you can't trust a
-   comparison between two models.
+Dependencies point one way only. Two consequences worth enforcing in review:
 
-§4's `*_run` tables and §6's config hashing exist to fix (2). §5 fixes (1).
+- **`features/` and `labels/` do no I/O and import nothing from `ingest/`.** They're pure
+  functions over DataFrames. That's what makes them unit-testable without a network or a
+  database, which in turn is what makes §10.5's leakage tests possible.
+- **`ingest/` is the only module that makes HTTP calls.** All network flakiness,
+  retries, and rate-limit handling is contained there.
+
+### What went wrong in the previous attempt
+
+The user's earlier project (`~/code/stock-market-entry-signal-tpsl-specific`) had a 52 KB
+`fetch_stock_data.py`, a 44 KB `train.py`, and a `data/` directory accumulating files like
+`AAPL_tpsl_data_20260610.csv`, one per ticker per day. Two concrete failure modes that
+this layout exists to fix:
+
+1. **No cache.** Every run re-downloaded everything, so it self-inflicted API rate limits
+   and iteration was slow. → §7.
+2. **No provenance.** Given `models/xyz.pkl` there was no way to recover which features,
+   which parameters, or which date range produced it. **So you couldn't meaningfully
+   compare two models** — the central activity of the project. → the `*_run` tables in §5.
 
 ---
 
-## 3. Data flow
+## 5. Storage layer
 
-```
-                yfinance (rate-limited, retroactively restated)
-                             │
-                   ┌─────────▼──────────┐
-                   │  ingest/sync.py    │  asks: what's actually missing?
-                   │  (coverage-aware)  │  only fetches the gaps
-                   └─────────┬──────────┘
-                             │  raw, UNADJUSTED bars + corporate actions
-                   ┌─────────▼──────────┐
-                   │  data/market.db    │  ← the only expensive-to-rebuild thing
-                   │  (SQLite, STRICT)  │     THIS is the cache that matters
-                   └─────────┬──────────┘
-                             │  read_bars(symbol, adjust=True)  ← adjust on READ
-                   ┌─────────▼──────────┐
-                   │ features/pipeline  │  TA-Lib + custom; all scale-free (§7.5)
-                   └─────────┬──────────┘
-                             │
-          ┌──────────────────┴──────────────────┐
-          │                                      │
- ┌────────▼─────────┐                  ┌────────▼──────────┐
- │ data/features/   │                  │ labels/triple_    │
- │   *.parquet      │                  │   barrier.py      │
- └────────┬─────────┘                  └────────┬──────────┘
-          │                                      │ y, t1, ret, weight
-          └──────────────────┬───────────────────┘
-                             │
-                   ┌─────────▼──────────┐
-                   │ model/train.py     │  purged walk-forward CV
-                   └─────────┬──────────┘
-                             │
-          ┌──────────────────┴──────────────────┐
- ┌────────▼─────────┐                  ┌────────▼──────────┐
- │ backtest/engine  │                  │ decide.py         │
- │ (honest metrics) │                  │ (today's call)    │
- └──────────────────┘                  └────────┬──────────┘
-                                                 │
-                                        reports/ + decision table in SQLite
-                                        (so you can score your own track record)
+### What goes where, and why
+
+| Data | Store | Reason |
+|---|---|---|
+| Raw daily bars | **SQLite** | Expensive to re-acquire (network, rate limits). Needs transactions and durability. |
+| Corporate actions | **SQLite** | Small, critical, same reason |
+| Provenance / run metadata | **SQLite** | Relational, queried ad hoc |
+| Issued decisions + outcomes | **SQLite** | Append-only audit log |
+| Feature matrix | **Parquet** | Wide, numeric, recomputable in seconds. See the trade-off table below. |
+| Labels | **Parquet** | Same |
+| Exports for Excel | **CSV** | On demand only |
+
+The user asked for "CSV or SQLite" for features. Having looked at the access pattern,
+here's the honest comparison:
+
+| Option | Shape | Read speed | Schema churn | Verdict |
+|---|---|---|---|---|
+| SQLite **wide** (1 column per feature) | 120+ columns | fast | `ALTER TABLE` for every new indicator | ✗ |
+| SQLite **long** (`symbol, ts, name, value`) | 3 cols, ~5× the rows | needs a pivot on read | none | ○ available as export |
+| **Parquet** | wide, columnar, typed | fastest; column pruning | none | ✓ **default** |
+| CSV | wide, untyped | slow; loses dtypes and NaN fidelity | none | ○ available as export |
+
+**Reasoning:** features are *cheap and disposable* — a full rebuild over 10 tickers × 15
+years is seconds of TA-Lib work. What's expensive is the network fetch. So the store that
+needs to be durable and transactional is `bar_daily`, which is exactly SQLite's job. The
+feature matrix is a wide block of float64 read whole into pandas — Parquet's sweet spot —
+and it stays schema-free, so adding your 40th indicator is a one-line registry entry
+rather than a migration. Both other formats remain available:
+
+```bash
+tdm features export --format csv    --out data/exports/
+tdm features export --format sqlite --table feature_long
 ```
 
----
+### Schema conventions
 
-## 4. SQLite schema
-
-Design rules:
-
-- **SQLite stores only what is expensive to re-acquire**: raw bars, corporate actions,
-  instrument metadata, and run provenance. Derived matrices go to Parquet (§6).
-- **`STRICT` tables** throughout (SQLite 3.51 is bundled with Python 3.15; `STRICT`
-  needs only 3.37+). Without `STRICT`, SQLite's type affinity will happily store the
-  string `"NaN"` in a `REAL` column and you will find out during training.
-- **Dates are ISO-8601 `TEXT`** (`'2026-11-03'`). Avoids the pandas 3 datetime-resolution
-  trap entirely, sorts lexicographically, and is readable in a SQL console.
-- **Raw prices only.** See the boxed note below — this is the single most important
-  schema decision in the document.
+- **`STRICT` tables** throughout. SQLite's default type affinity will cheerfully store the
+  string `"NaN"` in a `REAL` column, and you'd find out during training. `STRICT` needs
+  SQLite 3.37+; Python 3.15 bundles 3.51. Use it.
+- **Dates are ISO-8601 `TEXT`** (`'2026-11-03'`). Sidesteps the pandas 3 datetime
+  resolution change, sorts lexicographically, readable in a SQL console.
+- **Raw prices only.** See §6 — this is the schema decision that matters most.
 
 ```sql
-PRAGMA journal_mode = WAL;        -- concurrent read while a fetch writes
+PRAGMA journal_mode = WAL;        -- read while a fetch writes
 PRAGMA synchronous  = NORMAL;
 PRAGMA foreign_keys = ON;
 
@@ -299,58 +398,58 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE instrument (
     symbol        TEXT PRIMARY KEY,
     name          TEXT,
-    exchange      TEXT,                     -- 'NMS', 'NYQ', ...
+    exchange      TEXT,
     currency      TEXT    NOT NULL DEFAULT 'USD',
     asset_type    TEXT    NOT NULL DEFAULT 'equity',   -- equity | etf | index
-    shortable     INTEGER NOT NULL DEFAULT 1,          -- 0 => model may only go long
-    active        INTEGER NOT NULL DEFAULT 1,
+    shortable     INTEGER NOT NULL DEFAULT 1,          -- 0 => long-only for this ticker
+    active        INTEGER NOT NULL DEFAULT 1,          -- 0 => delisted; KEEP the rows (§10.5)
     first_bar     TEXT,
     last_bar      TEXT,
-    meta_json     TEXT,                     -- raw provider payload, for later needs
+    meta_json     TEXT,                                -- raw provider payload
     updated_at    TEXT    NOT NULL
 ) STRICT;
 
--- ── Raw daily bars — the core cache ──────────────────────────────────────────
+-- ── Raw daily bars: the cache that matters ───────────────────────────────────
 CREATE TABLE bar_daily (
     symbol        TEXT    NOT NULL REFERENCES instrument(symbol),
     ts            TEXT    NOT NULL,         -- session date, exchange-local
     open          REAL    NOT NULL,
     high          REAL    NOT NULL,
     low           REAL    NOT NULL,
-    close         REAL    NOT NULL,         -- UNADJUSTED close
+    close         REAL    NOT NULL,         -- UNADJUSTED (§6)
     volume        INTEGER NOT NULL,
     source        TEXT    NOT NULL,         -- 'yahoo'
     ingested_at   TEXT    NOT NULL,
-    revision      INTEGER NOT NULL DEFAULT 1,  -- bumped if provider restates the bar
+    revision      INTEGER NOT NULL DEFAULT 1,  -- bumped if the provider restates the bar
     PRIMARY KEY (symbol, ts)
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX idx_bar_daily_ts ON bar_daily(ts);
 
--- ── Corporate actions — why we don't cache adjusted prices ───────────────────
+-- ── Corporate actions: why we don't store adjusted prices ────────────────────
 CREATE TABLE corporate_action (
     symbol        TEXT NOT NULL REFERENCES instrument(symbol),
     ts            TEXT NOT NULL,
     kind          TEXT NOT NULL,            -- 'dividend' | 'split' | 'capital_gain'
-    value         REAL NOT NULL,            -- cash amount, or split ratio (2.0 = 2:1)
+    value         REAL NOT NULL,            -- cash amount, or split ratio (10.0 = 10:1)
     ingested_at   TEXT NOT NULL,
     PRIMARY KEY (symbol, ts, kind)
 ) STRICT;
 
--- ── Fetch bookkeeping — "don't fetch it twice" lives here ────────────────────
+-- ── Fetch bookkeeping: "don't download it twice" lives here ───────────────────
 CREATE TABLE fetch_coverage (
     symbol        TEXT NOT NULL,
     interval      TEXT NOT NULL,            -- '1d'
     source        TEXT NOT NULL,
-    start_ts      TEXT NOT NULL,            -- earliest session we have
-    end_ts        TEXT NOT NULL,            -- latest session we have
+    start_ts      TEXT NOT NULL,            -- earliest session held
+    end_ts        TEXT NOT NULL,            -- latest session held
     bar_count     INTEGER NOT NULL,
     last_fetch_at TEXT NOT NULL,
     PRIMARY KEY (symbol, interval, source)
 ) STRICT;
 
--- Sessions the calendar says exist but the provider returned nothing for.
--- Without this table you re-request the same holes every single run, forever.
+-- Sessions the calendar says exist but the provider has no data for.
+-- Without this table, every run re-requests the same permanent holes forever.
 CREATE TABLE known_gap (
     symbol        TEXT NOT NULL,
     ts            TEXT NOT NULL,
@@ -370,19 +469,21 @@ CREATE TABLE fetch_log (
     at            TEXT NOT NULL
 ) STRICT;
 
--- ── Earnings dates — a swing-trade-specific hazard, see §7.3 ─────────────────
+-- ── Scheduled events we must not trade through (§13) ─────────────────────────
 CREATE TABLE earnings_event (
     symbol        TEXT NOT NULL REFERENCES instrument(symbol),
     ts            TEXT NOT NULL,
-    session       TEXT,                     -- 'bmo' | 'amc' | 'unknown'
+    session       TEXT,                     -- 'bmo' (before open) | 'amc' (after close)
     confirmed     INTEGER NOT NULL DEFAULT 0,
-    ingested_at   TEXT NOT NULL,
+    ingested_at   TEXT NOT NULL,            -- when WE learned it (§10.5 item 6)
     PRIMARY KEY (symbol, ts)
 ) STRICT;
 
--- ── Provenance: which code+config produced which artifact ────────────────────
+-- ── Provenance: which code + config produced which artifact ──────────────────
+-- Content-addressed: run_id = hash(config, code_version, date_range, symbols).
+-- This is what the previous project lacked.
 CREATE TABLE feature_run (
-    run_id        TEXT PRIMARY KEY,         -- hash(feature_set, code_ver, date_range)
+    run_id        TEXT PRIMARY KEY,
     feature_set   TEXT NOT NULL,
     config_json   TEXT NOT NULL,
     code_version  TEXT NOT NULL,            -- git describe --always --dirty
@@ -402,37 +503,36 @@ CREATE TABLE label_run (
 ) STRICT;
 
 CREATE TABLE model_run (
-    run_id            TEXT PRIMARY KEY,
-    feature_run_id    TEXT NOT NULL REFERENCES feature_run(run_id),
-    label_run_id      TEXT NOT NULL REFERENCES label_run(run_id),
-    model_kind        TEXT NOT NULL,        -- 'decision_tree' | 'hgb' | 'xgboost'
-    side              TEXT NOT NULL,        -- 'long' | 'short'
-    params_json       TEXT NOT NULL,
-    cv_metrics_json   TEXT NOT NULL,
+    run_id               TEXT PRIMARY KEY,
+    feature_run_id       TEXT NOT NULL REFERENCES feature_run(run_id),
+    label_run_id         TEXT NOT NULL REFERENCES label_run(run_id),
+    model_kind           TEXT NOT NULL,     -- 'decision_tree' | 'hgb' | 'xgboost'
+    side                 TEXT NOT NULL,     -- 'long' | 'short'
+    params_json          TEXT NOT NULL,
+    cv_metrics_json      TEXT NOT NULL,
     holdout_metrics_json TEXT,
-    artifact_path     TEXT NOT NULL,
-    created_at        TEXT NOT NULL
+    artifact_path        TEXT NOT NULL,
+    created_at           TEXT NOT NULL
 ) STRICT;
 
--- ── Your own live track record ───────────────────────────────────────────────
+-- ── Audit log of what the system actually told you to do ─────────────────────
 CREATE TABLE decision (
-    id            INTEGER PRIMARY KEY,
-    model_run_id  TEXT NOT NULL REFERENCES model_run(run_id),
-    symbol        TEXT NOT NULL,
-    as_of         TEXT NOT NULL,            -- session whose close drove the decision
-    action        TEXT NOT NULL,            -- 'LONG' | 'SHORT' | 'HOLD'
-    confidence    REAL NOT NULL,
-    entry_ref     REAL,                     -- expected entry (next open)
-    tp_price      REAL, sl_price REAL,
-    atr_at_signal REAL,
-    max_hold_days INTEGER,
+    id             INTEGER PRIMARY KEY,
+    model_run_id   TEXT NOT NULL REFERENCES model_run(run_id),
+    symbol         TEXT NOT NULL,
+    as_of          TEXT NOT NULL,           -- the session whose close drove it
+    action         TEXT NOT NULL,           -- 'LONG' | 'SHORT' | 'HOLD'
+    confidence     REAL NOT NULL,
+    entry_ref      REAL,
+    tp_price       REAL, sl_price REAL,
+    atr_at_signal  REAL,
+    max_hold_days  INTEGER,
     rationale_json TEXT,                    -- top contributing features
-    created_at    TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
     UNIQUE (model_run_id, symbol, as_of)
 ) STRICT;
 
--- Filled in later by `tdm score-decisions`. This is how you find out whether the
--- thing actually works on data it has never seen, in the only test that counts.
+-- Filled in later by `tdm score-decisions` (§13). This is the real scoreboard.
 CREATE TABLE decision_outcome (
     decision_id   INTEGER PRIMARY KEY REFERENCES decision(id),
     resolved_ts   TEXT NOT NULL,
@@ -444,808 +544,908 @@ CREATE TABLE decision_outcome (
 ) STRICT;
 ```
 
-> ### ⚠️ Store RAW prices, adjust on read
->
-> It is tempting to let `yfinance` hand you `auto_adjust=True` (its default in 1.x) and
-> save those numbers. **Don't.** Adjusted prices are a *function of all corporate actions
-> that have happened since*, so they are retroactively rewritten every time a ticker
-> splits or pays a dividend. If you cache adjusted closes, then NVDA announces a split,
-> your cache is now silently inconsistent: bars fetched before the split disagree with
-> bars fetched after, your 200-day EMA has a cliff in it, and nothing errors out.
->
-> So: fetch with `auto_adjust=False, actions=True`, store the raw OHLCV in `bar_daily`
-> and the actions in `corporate_action`, and compute the cumulative adjustment factor at
-> **read** time in `store/bars.py::read_bars(..., adjust=True)`. Adjustment becomes a
-> pure, re-derivable function of two immutable tables. A split arriving later changes
-> nothing on disk and everything downstream recomputes correctly.
->
-> Volume needs the inverse split adjustment (2:1 split ⇒ historical volume ×2). Easy to
-> forget; `tests/test_indicators.py` should cover it with a known split (e.g. NVDA 10:1,
-> 2024-06-10).
+---
+
+## 6. The cache-invalidation problem: store raw, adjust on read
+
+This is the single most important schema decision, and it's a pure engineering problem —
+no finance knowledge needed to see why.
+
+**The domain fact:** when a company does a 10-for-1 **split**, every shareholder's 1 share
+becomes 10 shares, each worth 1/10th as much. Nothing of value changed. But the price
+series now has a 90% cliff in it at that date. So data providers offer *adjusted* prices:
+all history before the split is divided by 10, making the series continuous again.
+
+**The engineering problem:** an adjusted price is **a derived value computed from every
+corporate action that has happened since.** It is not a fact about the past; it's a
+function of the present. When a new split happens, *every historical adjusted price
+changes.*
+
+`yfinance` defaults to `auto_adjust=True`, so the obvious implementation stores exactly
+those adjusted numbers. Then:
+
+```
+Jan 2026:  fetch NVDA 2015-2025, store adjusted closes.      ✓ consistent
+Jun 2026:  NVDA does a 4:1 split.
+Jul 2026:  fetch NVDA 2026 (incremental). Provider now returns
+           everything on the NEW adjustment basis.
+           -> rows written before June and rows written after June
+              are on DIFFERENT SCALES, in the same table.
+```
+
+Your 200-day moving average now has a 75% discontinuity in the middle of it. **Nothing
+raises an error.** No constraint is violated. The data is just quietly wrong, and every
+model trained on it is wrong, and you will not find out from a stack trace.
+
+**The fix** — treat it like any derived-value caching problem: don't cache the derived
+value, cache the inputs and compute on read.
+
+```python
+# ingest: fetch and store the immutable facts
+df = yf.download(symbol, auto_adjust=False, actions=True)   # RAW prices
+store.upsert_bars(symbol, df[["Open","High","Low","Close","Volume"]])
+store.upsert_actions(symbol, df[["Dividends","Stock Splits"]])
+
+# read: derive adjustment at query time
+def read_bars(symbol: str, *, adjust: bool = True,
+              as_of: str | None = None) -> pd.DataFrame:
+    bars    = _raw_bars(symbol)
+    actions = _actions(symbol, before=as_of)      # as_of enables point-in-time reads
+    if adjust:
+        factor = _cumulative_adjustment_factor(actions, bars.index)
+        bars[["open","high","low","close"]] *= factor
+        bars["volume"] /= factor                  # ← inverse! see below
+    return bars
+```
+
+Now `bar_daily` and `corporate_action` hold only immutable facts, adjustment is a pure
+function of the two, and a split arriving in June recomputes all history correctly with
+zero writes. The `as_of` parameter additionally gives you point-in-time reads, which §10.5
+needs.
+
+> **Easy bug to miss:** volume adjusts in the *opposite* direction. A 10:1 split means
+> historical share counts must be **multiplied** by 10 while prices are divided by 10.
+> `tests/test_indicators.py` should pin this against a real split — NVDA's 10:1 on
+> 2024-06-10 is a good fixture.
 
 ---
 
-## 5. Incremental fetch: "never download the same bar twice"
+## 7. Incremental ingest: never download the same bar twice
 
-This is the requirement you called out explicitly, so it gets a full algorithm.
+The user's explicit requirement. This is a cache-coherency problem with three wrinkles:
+the upstream is rate-limited, it has permanent holes that look identical to cache misses,
+and it revises recent rows.
 
-### The planner
+### The provider interface
 
-```
-sync(symbol, requested_start, interval='1d'):
+`ingest/` is the only package that touches the network, behind one protocol — so a
+different data source (crypto via `ccxt`, another broker's API) slots in without touching
+anything downstream:
 
-  1. sessions   := NYSE calendar sessions in [requested_start, today]   (exchange_calendars)
-  2. last_final := last session whose close + settle_lag has passed
-                   # a bar is not trustworthy until the session has actually closed;
-                   # running at 14:00 ET must not cache a half-formed bar as final
-  3. target     := sessions ∩ [requested_start, last_final]
+```python
+class Provider(Protocol):
+    name: str
 
-  4. cov := fetch_coverage[symbol, interval, source]
-     if cov is None:
-         missing := target                                  # cold start
-     else:
-         head    := target ∩ [requested_start, cov.start_ts)   # extend history backwards
-         tail    := target ∩ (cov.end_ts, last_final]          # the normal daily case
-         interior:= target \ (bars_present ∪ known_gap)         # heal real holes only
-         missing := head ∪ tail ∪ interior
+    def fetch_bars(self, symbol: str, start: date, end: date,
+                   interval: str = "1d") -> pd.DataFrame:
+        """Raw, UNADJUSTED OHLCV. Raises RateLimited (retryable)
+        or ProviderError (fatal). Returns empty frame for no data."""
 
-  5. missing := missing \ known_gap        # don't re-ask about holidays/pre-IPO holes
-
-  6. if missing is empty:  log 'ok, 0 rows', RETURN      # <-- the whole point
-  7. coalesce `missing` into contiguous date ranges (one HTTP call per range,
-     not one per day), and widen each range's tail by `RESTATE_LOOKBACK = 5`
-     sessions to pick up provider restatements of recent bars
-
-  8. for each range: provider.fetch(...) with exponential backoff + jitter on
-     YfRateLimitError; UPSERT; bump `revision` where OHLCV changed
-
-  9. any target session still absent after a successful fetch -> INSERT into
-     known_gap(reason='no_data')
-
- 10. recompute fetch_coverage; append fetch_log
+    def fetch_actions(self, symbol: str) -> pd.DataFrame: ...
+    def fetch_metadata(self, symbol: str) -> dict: ...
 ```
 
-### Why each piece exists
+### The sync planner
 
-- **`known_gap`** — without it, every run asks Yahoo again for Thanksgiving 2019 and
-  for the years before the ticker's IPO. Those requests always come back empty, so a
-  naive "which dates am I missing?" check never converges and you burn your rate limit
-  on holes that will never fill.
-- **`last_final` / settle lag** — guards against caching a partially formed bar when you
-  run the tool mid-session. Without this, an intraday run poisons the cache with a bar
-  whose "close" is just the last trade so far.
-- **`RESTATE_LOOKBACK = 5`** — Yahoo does revise recent bars (volume especially). Always
-  re-pull the last week and UPSERT; it costs one request and keeps the tail honest.
-  `revision` increments so you can see it happening.
-- **Coalescing ranges** — one call for `2015-01-01..2026-11-03` instead of 2,700 calls.
-- **Backoff on `YfRateLimitError`** — yfinance 0.2.52+ raises this explicitly; treat it
-  as retryable, log it to `fetch_log`, and never let it look like a data gap.
+```python
+def plan(symbol: str, requested_start: date) -> list[DateRange]:
+    # 1. What days SHOULD exist? (market calendar, not just weekdays)
+    sessions = calendar.sessions_in_range(requested_start, today)
 
-### CLI surface
+    # 2. Which of those are final? A bar isn't trustworthy until the
+    #    session has actually closed. Running at 14:00 ET must not
+    #    cache a half-formed bar as if it were done.
+    last_final = calendar.last_closed_session(now, settle_lag)
+    target = [s for s in sessions if s <= last_final]
+
+    # 3. Subtract what we already have
+    cov = store.coverage(symbol, "1d", provider.name)
+    if cov is None:
+        missing = target                                        # cold start
+    else:
+        head     = [s for s in target if s <  cov.start_ts]     # extend backwards
+        tail     = [s for s in target if s >  cov.end_ts]       # the normal daily case
+        interior = [s for s in target if not store.has_bar(symbol, s)]   # heal holes
+        missing  = head + tail + interior
+
+    # 4. Subtract the permanent holes. Without this step the set never
+    #    empties and you re-request Thanksgiving 2019 forever.
+    missing = [s for s in missing if not store.is_known_gap(symbol, s)]
+
+    if not missing:
+        return []            # <-- the whole point: zero HTTP calls
+
+    # 5. One request per contiguous run, not one per day.
+    ranges = coalesce_contiguous(missing)
+
+    # 6. Always re-pull the last few sessions: the provider revises
+    #    recent bars (volume especially). Costs one request, keeps the
+    #    tail honest, and `revision` makes it visible when it happens.
+    ranges = widen_tail(ranges, RESTATE_LOOKBACK_SESSIONS)
+
+    return ranges
+```
+
+Then execute: `fetch` each range with exponential backoff + jitter on `YfRateLimitError`
+(yfinance raises this explicitly since 0.2.52), `UPSERT` the rows, bump `revision` where
+OHLCV actually changed, record any still-absent target session as a `known_gap`, recompute
+`fetch_coverage`, and append to `fetch_log`.
+
+### Why each wrinkle needs its own mechanism
+
+| Wrinkle | Mechanism | What breaks without it |
+|---|---|---|
+| Market isn't open every day | `exchange_calendars` NYSE schedule | You treat ~10 holidays/year as missing data and re-request them every run |
+| Permanent holes (pre-IPO, halts) look like cache misses | `known_gap` table | The missing-set never converges; you burn the rate limit on holes that can never fill |
+| Running mid-session | `last_final` + settle lag | You cache a partial bar whose "close" is just the last trade so far, as if final |
+| Provider revises recent rows | `RESTATE_LOOKBACK = 5` + `UPSERT` + `revision` | Your recent tail silently diverges from the source |
+| Rate limiting | backoff + `fetch_log` status | A 429 gets misread as "no data" and written as a permanent `known_gap` |
+
+### Acceptance test
+
+The one that matters, and it's mechanically checkable:
 
 ```bash
-make fetch                                   # incremental, universe from config
+make fetch     # first run:  N HTTP calls
+make fetch     # second run: ZERO HTTP calls   <- assert this in CI
+```
+
+### CLI
+
+```bash
+tdm fetch                                      # incremental, universe from config
 tdm fetch --symbols NVDA,AMD --since 2015-01-01
-tdm fetch --force --symbols NVDA             # ignore coverage, re-pull and UPSERT
-tdm fetch --dry-run                          # print the fetch plan, make no calls
-tdm db status                                # per-symbol coverage, gaps, staleness
-tdm db verify                                # OHLC sanity: high>=low, no negatives,
-                                             # no zero-volume non-holidays, dupes
+tdm fetch --dry-run                            # print the plan, make no calls
+tdm fetch --force --symbols NVDA               # ignore coverage, re-pull and UPSERT
+tdm db status                                  # coverage, gaps, staleness per symbol
+tdm db verify                                  # integrity: high>=low, no negatives,
+                                               # no dupes, no zero-volume non-holidays
 ```
 
-`--dry-run` matters more than it sounds: it's how you confirm the cache logic works
-without waiting on the network, and it's what you check when a run is unexpectedly slow.
+`--dry-run` is how you test the planner without the network, and the first thing to reach
+for when a run is unexpectedly slow.
 
 ---
 
-## 6. Where derived data lives, and why not all in SQLite
+## 8. Feature engineering
 
-You asked for "csv or sqlite" for the computed indicators. Having thought about the
-access pattern, here's the recommendation and the honest tradeoff.
+### The contract
 
-| Store | Shape | Read speed | Schema churn | Verdict |
-|---|---|---|---|---|
-| SQLite **wide** (1 col/feature) | 120+ columns | fast | `ALTER TABLE` on every new indicator — painful | ✗ |
-| SQLite **long** (`symbol, ts, name, value`) | 3 cols, ~5× rows | needs a pivot on read | none | ○ optional |
-| **Parquet** | wide, columnar, typed | fastest; column pruning | none | ✓ **default** |
-| CSV | wide, untyped | slow; loses dtypes/NaN fidelity | none | ○ export only |
+Every feature is a pure function from a price series to a numeric series, registered with
+its metadata:
 
-**Recommendation: raw bars in SQLite, feature matrix in Parquet, CSV on demand.**
+```python
+@dataclass(frozen=True)
+class FeatureSpec:
+    name: str
+    fn: Callable[[pd.DataFrame], pd.Series]
+    warmup: int                  # leading rows that will be NaN
+    deps: tuple[str, ...] = ()   # other features this needs
+    normalize: Normalizer | None = None   # see §8.5
 
-The reasoning is that features are *cheap and disposable* — a full rebuild across 10
-tickers × 15 years of daily bars is seconds of TA-Lib work. What's expensive is the
-network fetch. So the cache that needs to be durable and transactional is `bar_daily`,
-and that's exactly what SQLite is good at. The feature matrix is a wide block of
-float64 that gets read whole into pandas — that's Parquet's sweet spot, and it stays
-schema-free so adding your 40th indicator is a one-line registry entry, not a migration.
-
-Both other formats stay available because you asked for them:
-
-```bash
-tdm features build --set extended            # -> data/features/<run_id>.parquet
-tdm features export --format csv    --out data/exports/   # for Excel
-tdm features export --format sqlite --table feature_long  # long-narrow, if you want SQL
+registry.register(FeatureSpec(
+    name="rsi_14",
+    fn=lambda df: talib.RSI(df["close"], timeperiod=14),
+    warmup=14,
+))
 ```
 
-The `feature_run` / `label_run` / `model_run` tables in §4 are the glue: the Parquet
-files are content-addressed by a hash of (feature-set config + code version + date
-range + symbol list), and that same `run_id` is recorded against every model trained
-from it. So `models/abc123.pkl` is always traceable back to the exact features,
-labels, and parameters that produced it. That's what the previous repo was missing,
-and it's what makes two models actually comparable.
+`warmup` is declared rather than inferred so the pipeline drops exactly the right number
+of leading rows instead of guessing — a 200-day EMA is NaN for its first 200 bars, and
+silently filling those with zeros would be a subtle poisoning of the training set.
 
----
+**No I/O in this layer**, which is what makes the leakage tests in §10.5 possible: you can
+call any feature on a synthetic 50-row DataFrame in a unit test.
 
-## 7. Indicators — research and design
+### 8.1 The user's requested indicators
 
-You listed eleven. All eleven are in, but **four need real modification** to be usable,
-and two of them are not indicators at all. I'd rather flag that now than have you
-discover it when the features turn out to be useless.
+All eleven are implemented. **Four need modification to be usable at all** — explained
+below, because these are data-modelling bugs, not finance opinions.
 
-### 7.1 Your list, as designed
+| # | Requested | What we actually compute, and why |
+|---|---|---|
+| 1 | **Bollinger Bands** (20, 2σ) | Store `%B` = `(close − lower)/(upper − lower)` and `bandwidth` = `(upper − lower)/mid`. Not the raw band *prices* — those are in dollars (§8.5). |
+| 2 | **RSI** (14) | Already 0–100 and dimensionless ✓. Store as-is. Plus RSI(2) and a divergence flag from §8.4. |
+| 3 | **MACD** (12,26,9) | ⚠️ **Measured in dollars.** Store `MACD/ATR` and `histogram/ATR`, plus bars-since-sign-change. |
+| 4 | **ADX** (14) | Already 0–100 ✓. Measures trend *strength* without direction — a natural first split for a tree. Pair with `(+DI − −DI)` for direction. |
+| 5 | **Momentum Oscillator** | Use **ROC** (rate of change, a percentage ✓) at lookbacks 5/10/21/63. Avoid TA-Lib's `MOM`, which returns a raw dollar difference. |
+| 6 | **OBV** | ⚠️ **A running cumulative sum** — its absolute value depends on how far back your data happens to start. Store the 21-day slope, z-scored. |
+| 7 | **Stochastic** (14,3,3) | `%K`, `%D` already 0–100 ✓. Plus `%K − %D`. |
+| 8 | **VWAP** | ⚠️ **Degenerate on daily bars** — see below. |
+| 9 | **Elliott Wave** | ⚠️ Not a formula. → §8.4 |
+| 10 | **Dow Theory** | ⚠️ Not a formula. → §8.4 |
+| 11 | **21 EMA trend** | `close/EMA21 − 1`, EMA21 slope in ATR units, and an ordinal 0–4 "how aligned are EMA 8/21/50/200". |
 
-| # | You asked for | Standard params | What we actually compute, and why |
-|---|---|---|---|
-| 1 | **Bollinger Bands** | 20, 2σ | **`%B`** = (C − lower)/(upper − lower), and **bandwidth** = (upper−lower)/mid. Never the raw band prices — those are in dollars (see §7.5). Bandwidth is a genuinely useful volatility-regime feature; low bandwidth = "squeeze" = breakout pending. |
-| 2 | **RSI** | Wilder 14 | Raw RSI(14) is already 0–100 and scale-free ✓. Add RSI(2) (short-term mean-reversion, well documented for swing) and an **RSI-divergence** flag from §7.4 pivots. |
-| 3 | **MACD** | 12, 26, 9 | ⚠️ **MACD is in price units** — AAPL's MACD and BRK.A's MACD are incomparable, and a tree splitting at "MACD > 1.8" learns nothing transferable. We store **MACD/ATR** and **histogram/ATR**, plus the signed bars-since-cross. |
-| 4 | **ADX** | 14 | ADX is 0–100 ✓, measures trend *strength* without direction. Excellent **regime gate**: >25 trending, <20 chop. Pair with `(+DI − −DI)` for direction. |
-| 5 | **Momentum Oscillator** | — | Use **ROC** at several lookbacks (5, 10, 21, 63) — already a percentage ✓. Prefer ROC over TA-Lib `MOM`, which returns a raw price difference. |
-| 6 | **OBV** | — | ⚠️ **OBV is a running cumulative sum**, so its level is an arbitrary number that depends on how far back your data starts. Unusable raw. We use **OBV's 21-day slope, z-scored**, and OBV/price divergence. |
-| 7 | **Stochastic** | 14, 3, 3 | %K and %D, both 0–100 ✓. Add `%K − %D` and bars-in-overbought/oversold. |
-| 8 | **VWAP** | — | ⚠️ **This is the big one — see the box below.** True VWAP is intraday and resets daily; on daily bars it degenerates to roughly the typical price of that one bar. Replaced by rolling VWAP + **anchored VWAP**. |
-| 9 | **Elliott Wave** | — | ⚠️ Not a computable indicator. Operationalized as Fibonacci-retracement features over ZigZag pivots — §7.4. |
-| 10 | **Dow Theory** | — | ⚠️ Not a computable indicator. Operationalized as HH/HL/LH/LL swing structure + volume + multi-timeframe confirmation — §7.4. |
-| 11 | **21 EMA trend** | 21 | `(C/EMA21 − 1)`, EMA21 slope normalized by ATR, and the **stack state** EMA8/21/50/200 (an ordinal 0–4 "how aligned is the trend" feature). |
-
-> #### ⚠️ On VWAP specifically
+> #### ⚠️ Why VWAP as specified doesn't work
 >
-> VWAP = Σ(price×volume)/Σ(volume) **accumulated from the session open, reset every day**.
-> It is an intraday execution benchmark. If you compute it on a daily bar you get
-> `(H+L+C)/3 × V / V` — the typical price of that bar, which carries no information
-> beyond the OHLC you already have. Many tutorials get this wrong.
+> VWAP = `Σ(price × volume) / Σ(volume)`, **accumulated from the market open and reset
+> every day**. It's an intraday metric.
 >
-> For daily/weekly swing trading the two meaningful variants are:
+> Compute it on a single daily bar and you get `typical_price × volume / volume` =
+> `typical_price`. It algebraically reduces to a number you already have from the OHLC.
+> Zero new information. (Many online tutorials get this wrong.)
 >
-> - **Rolling VWAP(n)** — volume-weighted average over the trailing *n* days (20, 50).
->   Feature: `C/RVWAP(n) − 1`. A volume-weighted cousin of distance-from-MA.
-> - **Anchored VWAP (AVWAP)** — accumulated from a *chosen event*, not a fixed window:
->   the last major swing low/high (from §7.4), the year-to-date open, or the last
->   earnings date. This is the version swing traders actually use, because it answers
->   "what's the average price everyone who bought since the bottom paid?" — which is a
->   real support/resistance level. Features: `C/AVWAP_swinglow − 1`,
->   `C/AVWAP_ytd − 1`, `C/AVWAP_earnings − 1`.
+> Two variants that do carry information at daily granularity:
 >
-> AVWAP-from-swing-low is, in my judgment, the most promising single item on your
-> original list once corrected — it's genuinely informative and it is not a linear
-> function of the moving averages you already have.
+> - **Rolling VWAP(n)** — volume-weighted mean over the trailing n days (20, 50).
+>   Feature: `close/rvwap(n) − 1`.
+> - **Anchored VWAP** — accumulate from a *chosen event* rather than a fixed window: the
+>   last major swing low/high (from §8.4), the start of the year, or the last earnings
+>   date. Features: `close/avwap_swinglow − 1`, `close/avwap_ytd − 1`.
+>
+> Anchored-VWAP-from-swing-low is, in my judgment, the most promising single item on the
+> original list once corrected — it's genuinely informative and, unlike most of the list,
+> it is not a near-linear function of the moving averages you already have.
 
-### 7.2 Additional indicators worth adding
+### 8.2 Additional features worth adding
 
-Researched specifically for **daily/weekly swing** horizons. The first two are the ones
-I'd push hardest for.
+**Tier 1 — these carry information nothing on the original list does**
 
-**Tier 1 — add these, they carry information nothing on your list does**
+- **Relative strength vs SPY** (ratio ROC at 21/63/126 days, plus cross-sectional
+  percentile rank). The requested list is entirely *absolute*: it cannot distinguish "NVDA
+  rose 5%" from "NVDA rose 5% while the whole market rose 9%" — which are opposite
+  signals. In published equity work, relative strength is repeatedly the strongest single
+  daily-horizon feature.
+- **Market-regime features** — computed once on SPY and broadcast to every row: SPY vs its
+  own 200-day EMA, SPY realized-volatility percentile, VIX level and percentile, fraction
+  of the universe above its own 50-day EMA. Up-markets and down-markets behave completely
+  differently, and giving a tree these lets it split on regime *first*, which is exactly
+  the structure you want for a 3-way decision.
+- **ATR(14) and ATR/close.** Needed for TP/SL anyway (§9); as a feature it's your
+  volatility-regime variable.
+- **Days-to-next-earnings** and **earnings-within-horizon** (§13 gate).
 
-- **Relative strength vs SPY** (ratio ROC at 21/63/126 d, plus cross-sectional
-  percentile rank). Across published equity work, relative strength is repeatedly the
-  strongest single daily-horizon feature. Your whole list is *absolute* — it can't tell
-  "NVDA is up 5%" from "NVDA is up 5% while the market is up 9%", which are opposite
-  signals.
-- **Market-regime features** (computed on SPY, broadcast to every row): SPY vs its 200
-  EMA, SPY 21-day realized vol percentile, VIX level + percentile, VIX term structure
-  (VIX3M/VIX), % of universe above its own 50 EMA. **Long setups and short setups behave
-  completely differently by regime**, and a tree given these can split on regime first
-  — which is exactly the structure you want for a long/short/hold decision.
-- **ATR(14) and normalized ATR** (`ATR/C`). You need ATR anyway for TP/SL (§8); as a
-  feature, normalized ATR is your volatility-regime variable.
-- **Days-to-next-earnings** and **is-earnings-within-horizon**. An earnings gap can jump
-  straight through a stop, which makes it the most common way a backtested swing
-  strategy dies in live trading. It must be a feature *and* a hard gate (§12). ⚠️ Note
-  the subtlety: future earnings dates must come from an as-of-that-date snapshot, not
-  today's calendar — see §9.5.
+**Tier 2 — cheap and complementary, given TA-Lib is already a dependency**
 
-**Tier 2 — cheap, complementary, standard for this horizon**
+Keltner Channels; Donchian / 52-week-high proximity (`close/max(high, 252)`); MFI(14)
+(volume-weighted RSI — bounded 0–100, so unlike OBV it's directly usable); Aroon(25)
+(measures *time since* extremes rather than price distance); Supertrend(10, 3×ATR) (binary
+state + distance-to-flip in ATRs — a natural tree feature); Ichimoku; CCI(20);
+Williams %R(14); and simple bar-shape features — `(close−low)/(high−low)`, `range/ATR`,
+overnight gap in ATRs, consecutive up/down days, volume vs its 20-day median.
 
-- **Keltner Channels** (EMA20 ± 2×ATR10) — ATR-based rather than σ-based; the
-  BB-inside-Keltner condition is the canonical "squeeze".
-- **Donchian / 52-week-high proximity** (`C/max(H,252)`) — breakout and momentum, and a
-  well-documented anomaly in its own right.
-- **MFI(14)** — volume-weighted RSI; bounded 0–100, so unlike OBV it's directly usable
-  and comparable across tickers.
-- **Aroon(25)** up/down/oscillator — measures *time since* extremes rather than price
-  distance; captures something the price-distance indicators don't.
-- **Supertrend(10, 3×ATR)** — binary trend state + distance-to-flip in ATRs. Popular for
-  swing and a natural tree feature.
-- **Ichimoku** (Tenkan/Kijun/cloud position, cloud thickness) — explicitly designed for
-  daily/weekly timeframes.
-- **CCI(20)**, **Williams %R(14)** — bounded oscillators, nearly free given TA-Lib.
-- **Candle/microstructure**: close-location-value `(C−L)/(H−L)`, range/ATR, gap size in
-  ATRs, consecutive up/down days, volume vs its 20-day median.
+**Tier 3 — weekly timeframe**
 
-**Tier 3 — weekly-timeframe mirrors (the "weekly" half of your request)**
+Resample daily → weekly (`W-FRI`) and recompute a **small** subset: weekly RSI, weekly
+MACD histogram/ATR, weekly ADX, weekly EMA21 position. Forward-fill onto daily rows.
 
-Resample daily → weekly (`W-FRI`) and recompute a **small** subset: weekly RSI(14),
-weekly MACD histogram/ATR, weekly ADX, weekly EMA21 position, weekly trend state.
-Then forward-fill onto daily rows.
+> ⚠️ **Leakage hazard — and the reason to keep this subset small.** On a Wednesday, the
+> current week's bar **isn't finished yet**. Using it hands the model partial knowledge of
+> the very move it's trying to predict. You must use the last **completed** weekly bar,
+> i.e. shift by one week before forward-filling. §10.5 item 3 asserts this.
 
-> ⚠️ **Leakage hazard, and the reason to keep this subset small.** On Wednesday, that
-> week's weekly bar is *not finished*. You must use the **last completed** weekly bar,
-> i.e. shift by one week before the forward-fill. Getting this wrong hands the model
-> partial knowledge of the current week — including some of the move you're trying to
-> predict. `tests/test_leakage.py` must assert that every weekly feature on date *d*
-> is computable from bars strictly before the Monday of *d*'s week.
+**Explicitly rejected:** TA-Lib's 60+ candlestick pattern recognizers (`CDL*`). Dumping 60
+sparse binary columns into a tree is an invitation to overfit, and the bar-shape features
+above capture the same information continuously in ~3 columns.
 
-**Explicitly not recommended**
-
-- Candlestick-pattern recognizers (TA-Lib's `CDL*`, 60+ of them). Very weak standalone
-  edge on daily bars, and dumping 60 sparse binary columns into a tree is an invitation
-  to overfit. The CLV + range/ATR features above capture the same information
-  continuously and in ~3 columns.
-- Deep-learning architectures on this data volume. See §9.1.
-
-### 7.3 Indicator redundancy — a real risk
+### 8.3 Redundancy is a real problem
 
 RSI, Stochastic, CCI, Williams %R and MFI are all bounded momentum oscillators and are
-**heavily mutually correlated** (|ρ| often > 0.8). Trees handle correlated inputs
-without breaking, but it has two costs: feature importances get diluted and become
-uninterpretable (importance splits arbitrarily among near-duplicates), and effective
-model complexity rises without new information.
+heavily mutually correlated (|ρ| often > 0.8). Trees tolerate correlated inputs, but there
+are two real costs: **feature importances become meaningless** (importance splits
+arbitrarily among near-duplicates, so you can't tell what the model is using), and
+effective complexity rises with no new information.
 
-Mitigation, as a pipeline step:
+Pipeline steps:
 
-1. Compute the full correlation matrix at `tdm features build` time and write it to
-   `reports/feature_corr.html`.
-2. Greedily drop one of any pair with |ρ| > 0.95, keeping the more interpretable member;
-   log every drop so it's visible and reviewable, not silent.
-3. Report **permutation importance on held-out folds**, not tree `feature_importances_`
-   (which is impurity-based, biased toward high-cardinality features, and computed
-   in-sample — it will lie to you).
+1. Compute the correlation matrix at build time → `reports/feature_corr.html`.
+2. Greedily drop one of any pair with |ρ| > 0.95, keeping the more interpretable one.
+   **Log every drop** — visible and reviewable, never silent.
+3. Report **permutation importance on held-out folds**, not sklearn's
+   `feature_importances_`. The built-in attribute is impurity-based, biased toward
+   high-cardinality features, and computed in-sample. It will mislead you.
 
-### 7.4 Operationalizing Elliott Wave and Dow Theory
+### 8.4 Elliott Wave and Dow Theory
 
-Both are **interpretive frameworks applied by humans**, not formulas. Fully automated
-Elliott wave counting is famously ambiguous — competent analysts disagree on the count
-for the same chart, and any count is revised as new bars arrive. So I will not pretend
-to compute "we are in wave 3". Instead both reduce to a shared primitive, and we extract
-*features* from it.
+Both are **interpretive human frameworks, not algorithms.** Automated Elliott wave
+counting is famously ambiguous — competent practitioners disagree on the same chart, and
+any count gets revised as new data arrives. I'm not going to pretend to compute "we are in
+wave 3". Instead both reduce to one shared primitive, and we extract measurable features
+from it.
 
-**The shared primitive: ZigZag swing pivots.**
+**The primitive: ZigZag swing pivots.** Find the local maxima and minima of the price
+series, ignoring wiggles below a threshold:
 
+```python
+def pivots(bars, threshold) -> list[Pivot]:
+    """Alternate between seeking a high and a low. Confirm a pivot only
+    once price has reversed by >= threshold from the running extreme.
+    threshold = 3 * ATR(14), or 5%."""
 ```
-pivots(bars, threshold = 3 × ATR(14)  OR  5%):
-    walk forward, alternating between seeking a swing high and a swing low;
-    confirm a pivot only once price has reversed by >= threshold from the extreme.
-```
 
-⚠️ **Critical: ZigZag is a lookahead trap.** Every charting-platform ZigZag is drawn
-with hindsight — the pivot at bar *t* is only *knowable* at bar *t+k*, once the reversal
-has actually happened. If you label pivots on the full series and feed them as features,
-you leak the future and your backtest will look spectacular and be worthless. So:
+> ⚠️ **ZigZag is a lookahead trap, and the highest-risk item in this feature set.**
+>
+> Every charting tool draws ZigZag *with hindsight*. The pivot sitting at bar `t` is only
+> **knowable** at bar `t+k`, once the reversal has actually occurred. Label pivots over the
+> full series, feed them as features, and you've handed the model the future. The backtest
+> will look spectacular and mean nothing.
+>
+> **So every pivot carries two timestamps:**
+>
+> ```python
+> @dataclass(frozen=True)
+> class Pivot:
+>     ts: date            # when the extreme occurred
+>     confirmed_at: date  # when it became KNOWABLE  <- filter on this
+>     price: float
+>     kind: Literal["high", "low"]
+> ```
+>
+> Features for date `d` may only reference pivots where `confirmed_at <= d`. Enforced in
+> the feature builder, asserted in `tests/test_leakage.py`.
 
-> **Every pivot carries a `confirmed_at` timestamp, and features on date *d* may only
-> reference pivots with `confirmed_at <= d`.** This is enforced in code (the pivot
-> detector emits `(pivot_ts, confirmed_at, price, kind)` and the feature builder filters
-> on `confirmed_at`) and asserted in `tests/test_leakage.py`. I consider this the
-> highest-risk item in the whole feature set.
-
-**Dow Theory features** (from confirmed pivots):
+**Dow Theory features** (the idea: trends persist, and are confirmed by volume and by
+agreement across timeframes):
 
 | Feature | Definition |
 |---|---|
-| `dow_trend` | +1 primary up (last 2 swing highs rising **and** last 2 swing lows rising), −1 primary down (both falling), 0 indeterminate |
+| `dow_trend` | `+1` if the last two swing highs *and* last two swing lows are both rising; `−1` if both falling; `0` otherwise |
 | `dow_trend_age` | bars since `dow_trend` last changed |
-| `swing_hh`, `swing_hl`, `swing_lh`, `swing_ll` | booleans on the most recent completed leg |
-| `dow_volume_confirm` | +1 if volume expands in the trend direction and contracts on counter-moves (Dow's volume-confirmation principle), else −1 |
-| `dow_mtf_agree` | daily `dow_trend` == weekly `dow_trend` (Dow's primary/secondary trend distinction, done properly as two timeframes) |
-| `dow_sector_confirm` | ticker's `dow_trend` == its sector ETF's `dow_trend` (the modern stand-in for Dow's rails-confirm-industrials idea) |
+| `swing_hh/hl/lh/ll` | booleans on the most recent completed leg |
+| `dow_volume_confirm` | `+1` if volume expands with the trend and contracts against it, else `−1` |
+| `dow_mtf_agree` | does daily `dow_trend` equal weekly `dow_trend` |
+| `dow_sector_confirm` | does the ticker's `dow_trend` equal its sector ETF's |
 
-**Elliott Wave features** (deliberately modest — ratios, not counts):
+**Elliott Wave features** — deliberately modest: ratios, not wave counts.
 
 | Feature | Definition |
 |---|---|
 | `leg_retrace_ratio` | current leg's retracement of the previous leg, as a fraction |
-| `fib_zone` | which Fibonacci band that lands in: <0.236, 0.236–0.382, 0.382–0.5, 0.5–0.618, 0.618–0.786, >0.786 (ordinal) |
-| `leg_extension_ratio` | current leg length ÷ previous leg length (1.618 and 2.618 being the watched values) |
-| `legs_since_major` | count of alternating legs since the last pivot exceeding 2× threshold — a weak proxy for "where in a 5-wave sequence are we" |
-| `impulse_vs_corrective` | is the current leg longer and steeper than the prior counter-leg (impulse-like) or shorter and shallower (corrective-like) |
-| `leg_slope_atr` | current leg's price change per bar, in ATR units |
+| `fib_zone` | which band that falls in: `<0.236`, `0.236–0.382`, `0.382–0.5`, `0.5–0.618`, `0.618–0.786`, `>0.786` (ordinal) |
+| `leg_extension_ratio` | current leg length ÷ previous leg length |
+| `legs_since_major` | alternating legs since the last pivot exceeding 2× threshold |
+| `impulse_vs_corrective` | is the current leg longer and steeper than the prior counter-leg |
+| `leg_slope_atr` | leg price change per bar, in ATR units |
 
-**My honest expectation:** the Dow-Theory structure features (especially `dow_trend`,
-`dow_mtf_agree`, `dow_trend_age`) should earn their place — they encode trend persistence
-in a form trees split on cleanly. The Elliott/Fibonacci features I expect to be weak.
-`leg_retrace_ratio` plausibly carries something real (retracement depth does relate to
-continuation odds); the Fibonacci-specific zone boundaries I'd treat as a hypothesis to
-be tested, not a prior to be trusted. We'll know from permutation importance on held-out
-folds, which is precisely why §7.3 insists on measuring it that way. If they come out
-flat, drop them — that's a successful experiment, not a failure.
+**My honest expectation:** the Dow structure features (`dow_trend`, `dow_mtf_agree`,
+`dow_trend_age`) should earn their place — they encode trend persistence in a form trees
+split on cleanly. **The Elliott/Fibonacci features I expect to be weak.**
+`leg_retrace_ratio` plausibly carries something; the specific Fibonacci boundaries I'd
+treat as a hypothesis to test, not a prior to trust. §8.3's held-out permutation
+importance will tell us. If they come out flat, delete them — that's a successful
+experiment, not a failure.
 
-### 7.5 The feature-engineering rule that matters most
+### 8.5 The normalization rule — read this one
 
-> **Every feature must be scale-free and approximately stationary.**
+> **Every feature must be dimensionless and roughly stationary.**
 
-A decision tree learns literal threshold rules: `if MACD > 1.84 then ...`. If a feature
-is measured in dollars, that rule is specific to one ticker at one price level and
-transfers to nothing. Train across 10 tickers over 15 years and these features
-contribute noise at best. This single issue is, in my experience, the most common
-reason a cross-sectional technical-indicator model fails to generalize, and it's
-invisible — the model trains fine and scores fine in-sample.
+A decision tree learns literal threshold comparisons: `if macd > 1.84`. If a feature is
+measured in dollars, that rule is specific to one ticker at one price level and transfers
+to nothing. Train across 10 tickers over 15 years and such features contribute pure noise.
 
-Transform table:
+The closest everyday analogy: comparing servers by raw bytes-free rather than
+percent-free. The threshold "alert below 10 GB" is meaningless across a fleet of different
+disk sizes. Same bug class, same fix — divide by something that sets the scale.
 
-| Raw quantity | Problem | Stored form |
+| Raw quantity | Problem | Stored as |
 |---|---|---|
-| Price, EMA, BB bands, VWAP, Ichimoku lines | dollars | ratio to close (`C/x − 1`) or distance in ATRs |
-| MACD, MACD histogram, MOM | dollars | ÷ ATR |
-| OBV, A/D line | unbounded cumulative sum | 21-d slope, then z-score over 252 d |
-| Volume | varies 1000× across tickers | ÷ 20-d median volume (log) |
+| price, EMA, Bollinger bands, VWAP, Ichimoku lines | dollars | ratio to close (`x/close − 1`) or distance in ATRs |
+| MACD, histogram, MOM | dollars | ÷ ATR |
+| OBV, A/D line | unbounded cumulative sum | 21-day slope, then z-score over 252 days |
+| volume | varies 1000× across tickers | ÷ 20-day median (log) |
 | ATR | dollars | ÷ close |
-| RSI, Stoch, ADX, MFI, CCI, Aroon, %B | already bounded ✓ | as-is |
-| Anything with a long tail | outliers dominate splits | winsorize at 1st/99th pct, or 252-d rolling percentile rank |
+| RSI, Stochastic, ADX, MFI, CCI, Aroon, %B | already bounded ✓ | as-is |
+| anything long-tailed | outliers dominate the splits | winsorize at 1/99th pct, or 252-day rolling percentile rank |
 
-Rolling z-scores and percentile ranks use **trailing windows only** (`min_periods` set,
-no centering) — a centered or full-sample z-score reaches into the future. Each registry
-entry declares its own warm-up length so the pipeline can drop exactly the right number
-of leading rows rather than guessing.
+> ⚠️ All rolling z-scores and percentile ranks use **trailing windows only** —
+> `min_periods` set, **never centered**, and never `.fit()` on the full series. A centered
+> window or a global `StandardScaler` reaches into the future. This is §10.5 item 4.
+
+This normalization issue is, in my experience, the most common reason a cross-sectional
+technical-indicator model fails to generalize — and it's invisible, because the model
+trains fine and scores fine in-sample.
 
 ---
 
-## 8. Labeling: the triple-barrier method
+## 9. Label generation: a race between three exit conditions
 
-This is where "should I go long/short so I take profit before I cut loss" becomes a
-supervised learning problem. The approach is the **triple-barrier method** (López de
-Prado, *Advances in Financial Machine Learning*), which fits your question almost
-exactly: instead of predicting a return, it asks *which exit happens first*.
+This is where the vague question "should I trade?" becomes a concrete supervised learning
+problem. The method is the **triple-barrier method** (from López de Prado, *Advances in
+Financial Machine Learning*).
 
-For each candidate entry bar *t*, on each side independently:
+### The idea
 
-```
-atr   := ATR(14)[t]                      # known at t's close — no leakage
-entry := open[t+1]                       # decide at t's close, fill at next open
-
-LONG:   TP = entry + k_tp × atr          # k_tp = 2.0
-        SL = entry − k_sl × atr          # k_sl = 1.0   -> R:R 2.0
-SHORT:  TP = entry − k_tp × atr
-        SL = entry + k_sl × atr
-
-scan bars t+1 .. t+H  (H = 10 sessions):
-    TP touched first              -> y = 1   (win)
-    SL touched first              -> y = 0   (loss)
-    both touched in the same bar  -> y = 0   (see below)
-    neither by t+H                -> exit at close[t+H]; y = 1 if net return > 0 else 0
-```
-
-Per sample we persist: `y`, `t1` (the bar where it resolved — **required** for purging),
-`exit_reason`, `gross_return`, `net_return`, `holding_days`, and `weight`.
-
-### Design decisions, with reasoning
-
-**The same-bar ambiguity, resolved pessimistically.** When a daily bar's high reaches TP
-*and* its low reaches SL, the OHLC does not tell you which came first — the intrabar path
-is not in the data. The honest options are to resolve pessimistically (assume SL), fetch
-intraday data to disambiguate, or drop the sample. **We assume SL hit first.** Resolving
-these optimistically is a classic silent backtest inflator, and it's worst exactly where
-it hurts most: in high-volatility bars, which is where your wide-TP trades live. Dropping
-the samples instead biases the training set toward calm regimes. The count of ambiguous
-bars is logged every run — if it exceeds ~5% of samples, the barriers are too tight
-relative to daily range and `k_sl` should widen.
-
-**Fill at the next open, not today's close.** Deciding on bar *t*'s close and claiming a
-fill at that same close assumes you traded the closing auction with information from it.
-Entering at `open[t+1]` is what you can actually do and costs a little realism in
-exchange for a lot of honesty. Overnight gap risk then shows up in the labels where it
-belongs.
-
-**Costs are inside the label, not bolted on later.** `net_return` subtracts commission,
-spread/slippage (modeled as a fraction of ATR, not a fixed bps — slippage scales with
-volatility), and for shorts a daily **borrow cost**. Because the timeout branch labels on
-`net_return > 0`, the model learns *post-cost* expectancy directly. Shorting is genuinely
-more expensive and more dangerous than going long, and the labels should say so rather
-than leaving you to remember it.
-
-**Two binary models, not one three-class model.** This is the design choice I'd most
-want you to scrutinize, so here is the argument. The obvious framing is a 3-class label
-(LONG / SHORT / HOLD). The problem: with asymmetric barriers (TP 2×ATR, SL 1×ATR), the
-long and short setups are *not* mirror images, so a single label can't represent both,
-and "HOLD" has no natural definition — you'd have to invent a dead-zone threshold and
-bake it into the labels, where you can never tune it again. Instead:
+Rather than predicting a price (hard, and not what you need), simulate the trade and ask
+**which exit fires first**. It's a race between three conditions — close to a `select` over
+three channels, or `asyncio.wait(..., FIRST_COMPLETED)`:
 
 ```
-M_long  : P(long  TP before SL | features)      binary
-M_short : P(short TP before SL | features)      binary
+     price
+       │
+  TP ──┼─────────────────────────────  ← "profit" barrier    → y = 1
+       │        ╱╲
+ entry─┼──────╱────╲──╱──────────────
+       │    ╱        ╲╱
+  SL ──┼──────────────────────────────  ← "loss" barrier      → y = 0
+       │
+       └────────────────────────┤
+        t+1                    t+10     ← timeout barrier     → y = sign(return)
 ```
 
-and HOLD emerges at decision time as *"neither probability clears its threshold"* (§12).
-The thresholds then become knobs you tune against the equity curve after training, which
-is exactly where you want them. It also lets each side learn its own feature
-relationships — short setups really do key off different variables (volatility
-expansion, breadth deterioration) than long setups.
+### The generator
 
-**Sample weights for overlapping labels.** Consecutive samples share future bars (bar
-*t* and *t+1* both look 10 days ahead), so they are not independent — and standard CV
-treats them as if they were, which inflates every metric. Two corrections, both from the
-same source as the labeling:
+```python
+def label_one(bars: pd.DataFrame, t: int, side: Side, cfg: LabelConfig) -> Label:
+    atr   = bars.atr_14.iloc[t]        # known at t's close — no future data
+    entry = bars.open.iloc[t + 1]      # we decide at t's close, fill at next open
 
-- **Uniqueness weight**: for each sample, average over `[t, t1]` of `1/concurrency(bar)`,
-  where `concurrency(bar)` counts how many live labels span it. Passed as
+    if side is Side.LONG:
+        tp, sl = entry + cfg.k_tp * atr, entry - cfg.k_sl * atr
+    else:
+        tp, sl = entry - cfg.k_tp * atr, entry + cfg.k_sl * atr
+
+    for i in range(t + 1, min(t + 1 + cfg.horizon, len(bars))):
+        hi, lo = bars.high.iloc[i], bars.low.iloc[i]
+        hit_tp = (hi >= tp) if side is Side.LONG else (lo <= tp)
+        hit_sl = (lo <= sl) if side is Side.LONG else (hi >= sl)
+
+        if hit_tp and hit_sl:          # same bar touched BOTH — see below
+            return Label(y=0, t1=bars.index[i], reason="ambiguous", ...)
+        if hit_tp:
+            return Label(y=1, t1=bars.index[i], reason="tp", ...)
+        if hit_sl:
+            return Label(y=0, t1=bars.index[i], reason="sl", ...)
+
+    # timeout: exit at the last bar's close, label on return net of costs
+    exit_px = bars.close.iloc[t + cfg.horizon]
+    net = net_return(entry, exit_px, side, cfg.costs)
+    return Label(y=int(net > 0), t1=..., reason="timeout", net_return=net, ...)
+```
+
+Per sample we persist `y`, **`t1`** (when it resolved — §10.3 needs this), `exit_reason`,
+`gross_return`, `net_return`, `holding_days`, and `weight`.
+
+### Five design decisions, with reasoning
+
+**1. The same-bar ambiguity, resolved pessimistically.** If a daily bar's high reaches TP
+*and* its low reaches SL, the OHLC **does not tell you which happened first** — the
+intrabar path isn't in the data. This is a genuine information loss, not a coding problem.
+Options: assume the loss, fetch intraday data, or drop the sample. **We assume the loss.**
+Resolving these optimistically is a classic silent backtest inflator, and it's worst
+exactly where it hurts most — in high-volatility bars, which is where wide-TP trades live.
+Dropping them instead biases the training set toward calm periods. The ambiguous count is
+logged every run; above ~5% of samples, the barriers are too tight for daily data and
+`k_sl` should widen.
+
+**2. Fill at the next open, not today's close.** Deciding at bar `t`'s close and claiming a
+fill at that same close assumes you traded using information from a price you then got.
+`open[t+1]` is what you can actually do. Costs a little realism, buys a lot of honesty.
+
+**3. Costs go *inside* the label, not bolted on afterward.** `net_return` subtracts
+commission, slippage (modeled as a fraction of ATR — execution noise scales with
+volatility, so fixed basis points would be wrong), and for short positions a daily
+borrowing cost. Because the timeout branch labels on `net_return > 0`, the model learns
+*post-cost* profitability directly rather than learning a gross signal you then have to
+remember to discount.
+
+**4. Two binary models, not one 3-class model.** The design choice most worth scrutinizing.
+The obvious framing is a 3-class label (LONG/SHORT/HOLD). Two problems: with asymmetric
+barriers (TP 2 ATR, SL 1 ATR) the up-bet and down-bet are **not mirror images**, so one
+label can't encode both; and "HOLD" would need an invented dead-zone threshold **baked
+into the labels, where you can never re-tune it.** Instead:
+
+```python
+M_long  : P(long  hits TP before SL | features)      # binary
+M_short : P(short hits TP before SL | features)      # binary
+```
+
+and HOLD *emerges at inference time* as "neither probability clears its threshold" (§13).
+The thresholds become runtime knobs you tune against results, which is where they belong.
+It also lets each direction learn its own feature relationships.
+
+**5. Sample weights, because the labels overlap.** Bar `t` and bar `t+1` both look 10 days
+ahead, so **consecutive samples share most of their future** and are not independent.
+Standard CV treats them as if they were, which inflates every metric. Two corrections:
+
+- **Uniqueness weight** — for each sample, average `1/concurrency(bar)` over `[t, t1]`,
+  where `concurrency(bar)` counts how many live labels span that bar. Passed as
   `sample_weight` so crowded periods don't dominate.
-- **Purging + embargo** in cross-validation — §9.3.
+- **Purging and embargo** in cross-validation — §10.3.
 
-**Configurable barriers.** `k_tp`, `k_sl`, `H`, and the ATR period all live in
-`config.toml` as a named *label profile*, hashed into `label_run.run_id`. So
-"TP 2 / SL 1 / 10 d" and "TP 3 / SL 1.5 / 20 d" are two comparable, reproducible
-experiments rather than an uncommitted edit. A `tdm labels sweep` command grids over
-profiles and reports base rate, mean holding period, and ambiguity rate for each — run
-this *before* training, because a profile with a 15% base rate is telling you the setup
-is rare and you'll be learning from very few positives.
+**Practical consequence:** 10 tickers × ~3,800 daily bars ≈ 38,000 rows, but the
+**effective independent sample count is more like 2,000–4,000.** That number, not the row
+count, is what should govern model complexity.
+
+### Configuration and the parameter sweep
+
+`k_tp`, `k_sl`, `horizon` and the ATR period form a named *label profile* in
+`config.toml`, hashed into `label_run.run_id`. So two settings are two reproducible,
+comparable experiments rather than an uncommitted edit.
+
+```bash
+tdm labels sweep     # grid over profiles; report base rate, mean holding
+                     # period, ambiguity rate for each
+```
+
+**Run this before training.** A profile with a 15% base rate is telling you the setup is
+rare and you'll be learning from very few positive examples — better to know that in five
+minutes than after a day of model tuning.
 
 ---
 
-## 9. The model
+## 10. Model and validation
 
-### 9.1 Recommendation
+### 10.1 Model choice
 
-You said "simple decision tree model (you can suggest this as well)". My suggestion is
-**both**, for two different jobs:
+The user asked for "a simple decision tree (you can suggest as well)". My suggestion is
+**both**, doing two different jobs:
 
 | Role | Model | Why |
 |---|---|---|
-| **Interpretability baseline** | `DecisionTreeClassifier(max_depth=3..5, class_weight='balanced', min_samples_leaf≈2%)` | You can print the entire rule set and read it. Invaluable: it tells you whether the model found something sensible ("ADX>25 and EMA-stack aligned and RSI<70 → long") or something absurd. Keep this permanently as a sanity check, not just a first step. |
-| **Workhorse** | `HistGradientBoostingClassifier` (sklearn 1.9, no extra dependency) | ✅ **Handles NaN natively** — a big practical win, since every indicator has a warm-up period and 200-EMA features are NaN for the first 200 bars per ticker. Fast, strong on tabular data, built-in early stopping. |
-| Alternative workhorse | `xgboost 3.4.1` | Comparable; worth it if you want `scale_pos_weight`, monotonic constraints, or GPU. Adds a dependency for a marginal gain — start with HGB. |
-| Also worth trying | `RandomForest` / `ExtraTrees` | Cheap variance baseline; if it beats HGB, your HGB is overfit. |
+| **Readable baseline** | `DecisionTreeClassifier(max_depth=3..5, class_weight="balanced", min_samples_leaf≈2%)` | You can print the entire rule set and read it. This tells you whether the model found something sensible or something absurd. **Keep it permanently as a sanity check**, not just as a first step. |
+| **Workhorse** | `HistGradientBoostingClassifier` (sklearn, no extra dependency) | ✅ **Handles NaN natively** — a significant practical win, since every indicator has a warm-up period and a 200-EMA feature is NaN for the first 200 bars of each ticker. Fast, strong on tabular data, built-in early stopping. |
+| Alternative | `xgboost` 3.4.1 | Comparable. Worth it for monotonic constraints or GPU; otherwise it's a dependency for marginal gain. Start with HGB. |
+| Variance check | `RandomForest` / `ExtraTrees` | Cheap baseline. If it beats HGB, your HGB is overfit. |
 
-**Why not a neural network.** 10 tickers × ~3,800 daily bars ≈ 38k rows, and after
-uniqueness weighting the *effective independent* sample count is more like 2–4k. On
-tabular data at that scale, gradient-boosted trees beat deep nets consistently in the
-published benchmarks. The previous repo carried a `torch` dependency; I'd drop it. If
-you later want sequence models, that's an argument for more tickers first, not a deeper
-architecture.
+**No neural networks.** Effective sample size is 2,000–4,000 (§9). On tabular data at that
+scale, gradient-boosted trees consistently beat deep nets in published benchmarks. The
+previous project carried a `torch` dependency; drop it. If you later want sequence models,
+that's an argument for *more tickers first*, not a deeper architecture.
 
-**A single global model, with ticker identity excluded.** Train one model across all
-tickers rather than one per ticker — per-ticker models get ~3,800 rows each and overfit.
-Deliberately **omit ticker ID as a feature**: it invites the model to memorize "NVDA went
-up 2015–2025", which is survivorship-flavored and won't repeat. Sector/industry as a
-categorical is acceptable; HGB supports native categoricals.
+**One global model across all tickers**, not one per ticker (per-ticker gets ~3,800 rows
+and overfits). **Deliberately exclude ticker identity as a feature** — it invites the model
+to memorize "NVDA went up 2015–2025", which is survivorship-flavored and won't repeat.
+Sector as a categorical is fine; HGB supports native categoricals.
 
-### 9.2 Class balance
+### 10.2 Class imbalance
 
-With TP 2×ATR / SL 1×ATR, the base win rate will be well under 50% (roughly 33% is
-break-even at 2:1 before costs). Don't fight this with resampling — SMOTE on
-time-series features generates samples that violate the temporal structure. Use
-`class_weight='balanced'` / `sample_weight`, and **tune the decision threshold**, which
-is what §12 does anyway.
+With TP 2 ATR / SL 1 ATR, the positive rate will be well under 50% (≈33% is break-even).
+**Don't fight it with resampling** — SMOTE on time-series features synthesizes rows that
+violate the temporal structure. Use `class_weight="balanced"` / `sample_weight`, and tune
+the decision threshold, which §13 does anyway.
 
-### 9.3 Validation — the part that determines whether any of this is real
+### 10.3 Validation — the section that determines whether any of this is real
 
-> **Naive K-fold cross-validation on this dataset is guaranteed to lie to you.** Two
-> independent leaks: (a) shuffled folds put future bars in training and past bars in
-> test; (b) even with contiguous folds, a label at the end of fold *k* resolves up to
-> *H* bars into fold *k+1*, so the training label literally contains test-period prices.
+> ⚠️ **`train_test_split` and `KFold` are both guaranteed to lie to you here.** Two
+> independent leaks:
+>
+> 1. **Shuffled folds** put future rows in train and past rows in test. You're predicting
+>    2019 using 2024 data.
+> 2. **Even with contiguous folds**, a label near the end of fold *k* resolves up to 10
+>    bars into fold *k+1* (that's what `t1` records). So the training label literally
+>    contains test-period prices.
+>
+> Leak (2) is the subtle one, and it's why `t1` exists.
 
-`model/cv.py` implements **`PurgedWalkForwardSplit`**:
+`model/cv.py` implements `PurgedWalkForwardSplit`:
 
 ```
-|== train ==|  purge  | embargo |== test ==|          fold 1
-|========= train =====|  purge  | embargo |== test ==|  fold 2
-...
+fold 1:  |== train ==| purge | embargo |== test ==|
+fold 2:  |======= train =====| purge | embargo |== test ==|
+fold 3:  |=========== train =======| purge | embargo |== test ==|
 ```
 
-- **Expanding-window walk-forward** — train on the past, test on the future, always.
-- **Purge**: drop any training sample whose `[t, t1]` interval overlaps the test window.
-  This is what `t1` from §8 is for.
-- **Embargo**: additionally drop training samples within *E* bars before the test start
-  (`E ≈ H`), because serial correlation leaks across the seam even without interval
+- **Expanding-window walk-forward** — always train on the past, test on the future.
+- **Purge** — drop any training sample whose `[t, t1]` interval overlaps the test window.
+- **Embargo** — additionally drop training samples within `E ≈ horizon` bars *before* the
+  test start, because serial correlation leaks across the seam even without interval
   overlap.
-- **A true final holdout**: the most recent ~18 months are *never* touched — not for
-  hyperparameters, not for threshold tuning, not for feature selection — until you have
-  one final model. Each peek costs you a bit of its honesty, so `tdm train` should
-  refuse to read it without an explicit `--unlock-holdout` flag. The flag is there to
-  make the peek a conscious decision you'll remember making.
+- **A true final holdout** — the most recent ~18 months are **never touched**: not for
+  hyperparameters, not for threshold tuning, not for feature selection. `tdm train` must
+  refuse to read it without an explicit `--unlock-holdout` flag. The flag exists to make
+  the peek a deliberate act you'll remember, because each peek spends a little of its
+  honesty.
 
-### 9.4 Metrics — accuracy is the wrong objective
+### 10.4 Metrics — accuracy is the wrong objective
 
-Accuracy on an imbalanced, asymmetric-payoff problem is close to meaningless; 70%
-accuracy achieved by predicting HOLD always is worth nothing. Report, per fold and on
-the holdout:
+Accuracy is near-meaningless on an imbalanced problem with asymmetric payoffs. A model
+that always says HOLD can score 70% accuracy and be worth exactly nothing. Report, per
+fold **and per direction**:
 
-**Classification:** precision at the operating threshold (← the one that matters: of the
-trades you actually take, how many win), recall/coverage (how many opportunities you
-catch), PR-AUC (better than ROC-AUC under imbalance), and **calibration** — a reliability
-curve, because §12 uses the probability as a confidence number and you need "0.7" to
-actually mean 70%. Calibrate with `CalibratedClassifierCV` on a purged inner split.
+**Classification:** precision at the operating threshold (the one that matters: *of the
+trades you actually take, how many win*), recall/coverage, PR-AUC (better than ROC-AUC
+under imbalance), and **calibration** — a reliability curve, because §13 prints the
+probability as a confidence number and "0.71" needs to actually mean 71%. Calibrate with
+`CalibratedClassifierCV` on a purged inner split.
 
-**Economic — these are the real scoreboard:**
+**Economic — the real scoreboard:**
 
-| Metric | Why it's here |
+| Metric | Why |
 |---|---|
-| **Expectancy per trade** = `p_win × avg_win − p_loss × avg_loss`, net of costs | The single number that decides whether to trade this |
+| **Expectancy per trade**, net of costs | The single number that decides whether to use this at all |
 | Profit factor | gross wins ÷ gross losses |
-| Hit rate + avg R multiple | the two factors behind expectancy |
-| Max drawdown, Calmar | whether you could actually sit through it |
-| Sharpe / Sortino (annualized) | risk-adjusted, comparable to buy-and-hold |
-| Trade count, avg holding days | <100 holdout trades ⇒ your estimate is noise |
-| **vs. buy-and-hold SPY over the same window** | the benchmark that matters. Beating a coin flip is not the bar; beating "do nothing and own the index" is |
+| Hit rate + average R multiple | the two components of expectancy |
+| Max drawdown, Calmar | whether you could actually tolerate it |
+| Sharpe / Sortino | risk-adjusted, comparable to doing nothing |
+| Trade count, avg holding days | **fewer than ~100 holdout trades ⇒ your estimate is noise** |
+| **vs. buy-and-hold SPY over the same window** | the benchmark that counts. Beating a coin flip isn't the bar; beating "do nothing and own the index" is |
 
-**Report the full distribution across folds, not the mean.** A strategy that was
-excellent 2017–2019 and flat since has a fine average and is not tradeable. Per-fold
-equity curves go in `reports/`.
+**Report the distribution across folds, never just the mean.** A strategy that was
+excellent 2017–2019 and flat since has a fine average and is untradeable. Per-fold equity
+curves go to `reports/`.
 
-### 9.5 Leakage checklist — `tests/test_leakage.py`
+### 10.5 Leakage checklist — `tests/test_leakage.py`
 
-Every item here is a leak I expect this project to hit at least once. Each gets a test.
+Every item here is a bug I expect this project to hit at least once. Each gets a test.
+**Treat this file as the most important one in the repo.**
 
-1. **No feature on date *d* may use any bar after *d*.** Property test: recompute every
-   feature on a series truncated at *d*; assert the value at *d* is bit-identical to the
-   full-series computation. This one test catches most of the rest.
-2. **ZigZag pivots respect `confirmed_at`** (§7.4). The highest-risk item.
-3. **Weekly features use the last *completed* weekly bar** (§7.2, Tier 3).
-4. **Scalers/z-scores/percentiles fit on trailing windows only** — never
-   `StandardScaler().fit(X_all)`.
-5. **Adjustment-factor lookahead** — splits rewrite history. Since we store raw prices
-   and adjust on read (§4), the test is that features computed as-of date *d* use only
-   corporate actions with `ts <= d`. ⚠️ Strictly, a prospective backtest should use the
-   adjustment factors *known at d*, not today's. Note this as a known, bounded
-   approximation rather than pretending it's solved.
-6. **Earnings dates** — today's earnings calendar is not what you knew six months ago.
-   Use `confirmed` + `ingested_at` to reconstruct as-of knowledge, and treat
-   `days_to_earnings` for historical rows as approximate. Document the limitation.
-7. **Survivorship bias** — a universe of today's winners (NVDA, META, TSLA...) is a
-   universe selected *because* they went up. **This is the one bias on the list that
-   good code cannot fix**, and it will make the backtest look better than reality.
-   Partial mitigations: include some has-beens (INTC is already in your list — good),
-   add ETFs, add a few tickers that did badly, and keep delisted names with
-   `active = 0` rather than deleting them. Mostly: know that the number is optimistic.
-8. **Threshold/hyperparameter tuning on the holdout** — §9.3's `--unlock-holdout`.
-9. **`t1`-based purging actually applied** — assert no training `[t, t1]` overlaps any
-   test fold.
+| # | Invariant | Test |
+|---|---|---|
+| 1 | **No feature at date `d` uses any bar after `d`** | Property test: recompute every feature on the series truncated at `d`; assert the value at `d` is identical to the full-series computation. **This single test catches most of the rest.** |
+| 2 | ZigZag pivots respect `confirmed_at` (§8.4) | Highest-risk item |
+| 3 | Weekly features use the last *completed* weekly bar (§8.2) | Assert every weekly feature at `d` is computable from bars strictly before `d`'s Monday |
+| 4 | Scalers / z-scores / percentiles use trailing windows only | Grep-level ban on `.fit(X_all)`; assert window params |
+| 5 | Corporate-action lookahead | Features as-of `d` use only actions with `ts <= d` (the `as_of` param in §6). ⚠️ Strictly, a prospective backtest should use the adjustment factors *known at d*, not today's — this remains a **known bounded approximation**, documented rather than pretended-away |
+| 6 | Earnings dates are as-of | Today's calendar isn't what you knew six months ago. Use `confirmed` + `ingested_at`; treat historical `days_to_earnings` as approximate and **say so** |
+| 7 | **Survivorship bias** | ⚠️ **The one item on this list that good code cannot fix.** A universe of today's winners was selected *because* they went up. Partial mitigations: include has-beens (INTC already qualifies), add ETFs, add some losers, and keep delisted tickers with `active = 0` **rather than deleting the rows**. Mostly: know the number is optimistic |
+| 8 | Holdout untouched | `--unlock-holdout` required (§10.3) |
+| 9 | Purging actually applied | Assert no training `[t, t1]` overlaps any test fold |
 
 ---
 
-## 10. Backtest
+## 11. Backtest
 
-A small event-driven walk-forward evaluator in `backtest/engine.py` (recall from §1 that
-`vectorbt` is unavailable on 3.15 — but we'd write this anyway, because the triple-barrier
-labeler already defines the exit logic and a second implementation of it would just be a
-second thing to keep in sync).
+A small event-driven replay harness in `backtest/engine.py`. Recall from §3 that
+`vectorbt` can't be installed on 3.15 — but we'd write this anyway, because §9's labeler
+already defines the exit logic, and a third-party framework would be a *second,
+independently-drifting* implementation of it. Here, one is the authority and the other
+replays it.
 
+```python
+for d in test_sessions:
+    x = features.loc[d]                        # from Parquet — never recomputed live
+    p_long, p_short = m_long.predict_proba(x), m_short.predict_proba(x)
+
+    orders = decision_rule(p_long, p_short, gates(d))     # SAME function as §13
+
+    # position sizing: risk a fixed fraction of equity per trade
+    shares = (risk_frac * equity) / (cfg.k_sl * atr)
+    # caps: max N concurrent positions, max exposure per sector
+
+    fills = fill_at(open_price[d + 1], slippage=s * atr)
+    manage_open_positions(d)        # TP / SL / timeout — SAME pessimistic
+                                    # same-bar rule as §9. Non-negotiable.
+    accrue_borrow_costs(d)
+    mark_to_market(d)
 ```
-for each session d in the test window:
-    1. features as-of d's close  (from the Parquet matrix — never recomputed live)
-    2. p_long, p_short := models.predict_proba
-    3. apply decision rule + gates (§12) -> candidate orders
-    4. position sizing: risk a fixed fraction f of equity per trade
-           shares = (f × equity) / (k_sl × ATR)          # fixed fractional risk
-       cap: max N concurrent positions, max exposure per sector
-    5. fill at open[d+1], applying slippage = s × ATR
-    6. manage open positions: TP / SL / timeout, same pessimistic
-       same-bar rule as §8 (the backtest must not be more optimistic than the labels)
-    7. accrue borrow cost on shorts; mark to market
-```
 
-**Cost model** (defaults in `config.toml`, all adjustable):
+> **The consistency requirement.** `decision_rule` and the exit logic are **imported** by
+> both the backtest and production (§13), never reimplemented. If the simulator is more
+> optimistic than the labeler, or production more permissive than the backtest, you've
+> trained and validated against a world you don't deploy into — and the discrepancy shows
+> up as unexplained live underperformance, which is almost impossible to debug after the
+> fact. Share the code.
+
+**Cost model** (defaults in `config.toml`):
 
 | Item | Default | Note |
 |---|---|---|
 | Commission | $0 + $0.005/share | typical US retail |
 | Slippage | 0.05 × ATR per side | volatility-scaled, not fixed bps |
-| Short borrow | 0.3%/yr on easy-to-borrow | accrued daily on open shorts; see §10.1 |
-| Short availability | assume unavailable if `instrument.shortable = 0` | |
-| Short entry blocked by SSR | skip the entry (don't fill at a worse price) | **§10.1** — this one materially changes short-side results |
+| Short borrow cost | 0.3%/yr | accrued daily on open shorts; §11.1 |
+| Short availability | unavailable if `instrument.shortable = 0` | |
+| Short entry blocked by regulation | **skip the entry** | §11.1 — materially changes short results |
 
 **Required sensitivity runs.** A single backtest number is not evidence. Report the grid:
-2× slippage, 2× commission, entry delayed one more bar, TP/SL multiples ±25%, horizon
-±5 days. **A strategy whose edge vanishes when slippage doubles did not have an edge** —
-it had a cost assumption. Also run the **randomized-signal control**: shuffle the
-predictions and re-backtest; if random does comparably, the model contributes nothing and
-the equity curve is measuring your position sizing.
+2× slippage, 2× commission, entry delayed one more bar, TP/SL multiples ±25%, horizon ±5
+days. **If the edge vanishes when slippage doubles, there was no edge — there was a cost
+assumption.**
 
-### 10.1 Short-side mechanics (confirmed in scope)
+Also run the **shuffled-signal control**: randomly permute the predictions and re-run. If
+random does comparably well, the model contributes nothing and your equity curve is just
+measuring the position sizing.
 
-You've confirmed you can short, so `M_short` is in. Shorting is not a sign flip on
-longs, and the asymmetries below are modeled explicitly rather than left for you to
-remember at the terminal.
+### 11.1 Short-side mechanics
 
-> #### ⚠️ Reg SHO Rule 201 — the short-side constraint that actually bites
->
-> The SEC's **alternative uptick rule** triggers when a stock declines **10% or more
-> from the prior day's close**. Once triggered, short sales may only be effected at a
-> price **above the current national best bid**, for the remainder of that day **and
-> the entire following day**.
->
-> **Why this is a real problem for this specific system, not a footnote:** a
-> mean-reversion or breakdown-continuation short signal fires precisely *after* a sharp
-> down day. That is exactly when SSR is active. So the setups the model most wants to
-> short are disproportionately the ones you cannot get filled on at market — and since
-> we enter at `open[t+1]`, a restricted open means a short-at-market order simply does
-> not execute at the price the backtest assumed.
->
-> If you ignore this, the backtest cheerfully books the best short entries in the
-> dataset and live trading silently skips them. That single discrepancy could account
-> for most of the gap between a good short backtest and a bad short track record.
->
-> **Handling:** derive `ssr_active[t]` from the stored bars — true if
-> `low[t] <= 0.90 × close[t-1]` (triggered today, restricted today + tomorrow) or if it
-> triggered on `t-1`. Then:
-> - **As a hard gate (§12):** if `ssr_active`, do not issue a market short. Report
->   `HOLD — SSR active` so you can place a limit order above the bid manually if you
->   want the trade.
-> - **As a backtest rule:** skip the entry entirely rather than filling it at a worse
->   price. Skipping is the honest model of "my market order didn't fill"; a fudged worse
->   fill invents a trade that wouldn't have happened.
-> - **As a feature:** `ssr_active` and `days_since_ssr` go into the matrix, since
->   "recently fell 10% in a day" is genuine regime information for both sides.
->
-> Note this is derived from daily OHLC, so it's an approximation — the true trigger is
-> an intraday print against the prior official close, and halts complicate it. It will
-> be close enough to matter and not exact. Document it as such.
+The user confirmed they can short, so `M_short` is in scope. Shorting is **not a sign flip
+on going long** — it has extra costs and, importantly, a regulatory precondition.
 
-Other short-side asymmetries:
+> #### ⚠️ Reg SHO Rule 201 — a precondition that fails on exactly the orders you want most
+>
+> **The rule** (SEC "alternative uptick rule", verified against sec.gov): if a stock falls
+> **10% or more below the previous day's close**, short sales in it are restricted — only
+> permitted at a price **above the current best bid** — for the rest of that day **and all
+> of the next**.
+>
+> **Why this specifically breaks this system.** A short signal fires *after* a sharp drop.
+> That is precisely when the restriction is active. So the setups the model most wants to
+> short are **disproportionately the ones a market order cannot fill** — and since we
+> enter at `open[t+1]` (§9), a restricted open means the order simply doesn't execute at
+> the price the backtest assumed.
+>
+> Ignore this and the backtest books the best-looking short entries in the dataset while
+> live trading silently skips them. That one discrepancy could account for most of the gap
+> between a good short backtest and a bad short track record. It's a precondition-check
+> bug, and it's invisible unless you model it.
+>
+> **Handling, three places:**
+> - **Derive the flag** from stored bars: `ssr_active[t]` is true if
+>   `low[t] <= 0.90 * close[t-1]` (triggered today ⇒ restricted today and tomorrow), or if
+>   it triggered at `t-1`.
+> - **Hard gate (§13):** if `ssr_active`, don't issue a market short. Report
+>   `HOLD — SSR active`, so you can still place a limit order by hand if you want it.
+> - **Backtest:** *skip* the entry rather than filling it at a worse price. Skipping
+>   honestly models "my order didn't fill"; a fudged worse fill invents a trade that never
+>   happened.
+> - **Feature:** `ssr_active` and `days_since_ssr` go in the matrix — "recently fell 10% in
+>   a day" is real information for both directions.
+>
+> Derived from daily OHLC, so this **approximates** an intraday trigger (and halts
+> complicate it further). Close enough to matter, not exact. Documented as such.
+
+Other asymmetries:
 
 | Item | Treatment |
 |---|---|
-| **Borrow cost** | Accrued daily on open shorts, inside `net_return` (§8), not bolted on afterward. Default 0.3%/yr; fine for the mega-caps in your universe, wildly optimistic for small caps. If the universe expands (§14 #1), this assumption needs revisiting. |
-| **Hard-to-borrow / recall** | Can't be reconstructed historically without a vendor borrow-rate feed. Treated as a known unmodeled risk: the backtest assumes every short is borrowable, which is optimistic. Mitigate by restricting shorts to high-ADV names via the liquidity gate. |
-| **Unbounded loss tail** | A stop caps your loss only if price passes *through* it. A short that gaps up 30% overnight on a buyout rumor fills far above the stop. The pessimistic same-bar rule (§8) already handles intrabar ambiguity, but **gap-through-stop is a separate, real tail** — report short-side max single-trade loss separately from the aggregate drawdown, so one outlier can't hide in the average. |
-| **Earnings gates matter more** | The earnings gate (§12) is doubly important for shorts: an upside earnings gap is the canonical way a short blows through its stop. |
-| **Margin** | Shorting requires a margin account and ties up maintenance margin, so a short position consumes more buying power than a long of the same notional. Position sizing (§10) uses the same fixed-fractional risk for both; if margin ever becomes the binding constraint, that's a sizing change, not a model change. |
+| **Borrow cost** | Accrued daily inside `net_return` (§9). The 0.3%/yr default is fine for large companies and wildly optimistic for small ones — revisit if the universe expands (§15 #1). |
+| **Hard-to-borrow / recall** | Can't be reconstructed historically without a paid borrow-rate feed. A **known unmodeled optimism**: the backtest assumes every short is borrowable. Mitigate by gating shorts to high-ADV tickers. |
+| **Gap-through-stop tail** | A stop-loss caps your loss only if price passes *through* it. An overnight gap can fill you far past it. §9's pessimistic same-bar rule handles *intrabar* ambiguity; this is a **separate** tail. **Report short-side max single-trade loss separately** from aggregate drawdown, so one outlier can't hide in an average. |
+| **Earnings gate matters more** | An upside earnings surprise is the canonical way a short blows through its stop. |
+| **Margin** | A short consumes more buying power than an equivalent long. Sizing uses the same fixed-fractional risk for both; if margin becomes binding, that's a sizing change, not a model change. |
 
-**Evaluate the two sides separately.** All of §9.4's metrics are reported per side, never
-pooled. Pooling hides the most likely outcome — that longs carry a modest edge and shorts
-carry none — behind a mediocre blended number. §11's warning stands: if `M_short` shows
-no out-of-sample edge, shipping long/flat is the correct response, and now it's a
-measured decision rather than an assumption.
+**Report all §10.4 metrics per direction, never pooled.** Pooling hides the most likely
+outcome — longs carry a modest edge, shorts carry none — behind a mediocre blended number.
 
 ---
 
-## 11. What "good" realistically looks like
+## 12. Realistic expectations
 
-Worth fixing expectations before you see the first number, so you can tell success from
-self-deception.
+Worth calibrating before you see a number, so you can tell success from self-deception.
 
-- At **2:1 R:R**, break-even is a **~33% hit rate** before costs, maybe ~36% after. So a
-  45% hit rate is a genuinely good result here, not a mediocre one. Judge expectancy, not
-  accuracy.
-- Out-of-sample PR-AUC meaningfully above base rate, and precision at threshold around
-  **0.50–0.60**, is a solid outcome for daily-bar technical features.
-- ⚠️ **If you see >65% out-of-sample accuracy or a smooth upward equity curve on the
-  first try, you have a bug, not an edge.** Go back to §9.5. This is the expected
-  failure mode, not a remote one — and the previous repo's structure (no purging, no
-  holdout discipline, per-day CSVs with no provenance) wouldn't have surfaced it.
-- Expect the honest outcome to be **"a modest edge in some regimes, nothing in others"**.
-  That's still useful: a model that reliably says HOLD during chop and sizes up in
-  trending regimes has value even with an unremarkable hit rate.
+- At **R:R 2.0**, break-even is a **~33% hit rate** before costs, ~36% after. So **45% is
+  a genuinely good result here**, not a mediocre one. Judge expectancy (§2), not accuracy.
+- Out-of-sample precision at threshold around **0.50–0.60** is a solid outcome for
+  daily-bar technical features.
+- ⚠️ **If your first run shows >65% out-of-sample accuracy, or a smooth upward equity
+  curve, you have a bug — not an edge.** Go back to §10.5. This is the *expected* failure
+  mode, not a remote one. The previous project's structure (no purging, no holdout
+  discipline, no provenance) would not have surfaced it.
+- Expect the honest outcome to be **"a modest edge in some market conditions, nothing in
+  others."** Still useful: a model that reliably says HOLD during choppy periods and sizes
+  up in trending ones has value even with an unremarkable hit rate.
 - **Position sizing and risk management will affect your results more than model
   accuracy.** Fixed-fractional risk, a cap on concurrent positions, and not trading
   through earnings are worth more than several points of AUC.
-- Be prepared for the result that **the shorts don't work**. US equity indices drift up;
-  short setups on daily bars have a worse base rate, higher costs, and unbounded loss
-  tails. If `M_short` has no edge out-of-sample, the correct response is to ship
-  long/flat only. That's a finding, not a defeat.
+- **Be prepared for the shorts not to work.** US stock indices drift upward over time;
+  short setups have a worse base rate, higher costs, and a worse tail (§11.1). If
+  `M_short` shows no out-of-sample edge, **ship long-only.** That's a finding, not a
+  defeat — and because §11.1 is modeled, it'll be a measured conclusion rather than a
+  guess.
 
 ---
 
-## 12. The daily decision
+## 13. Production inference: `tdm decide`
 
-`tdm decide --date today` is the command you'll actually run.
-
-### Decision rule
+The command actually run day to day.
 
 ```python
-p_long  = M_long.predict_proba(x)[1]
-p_short = M_short.predict_proba(x)[1]
+def decide(symbol: str, as_of: date) -> Decision:
+    x = features.load(symbol, as_of)          # from Parquet, not recomputed
 
-# Hard gates — these override the model, because the model cannot see them
-if earnings_within(horizon_days):      return HOLD, "earnings in N days"
-if adv_20d < min_liquidity:            return HOLD, "illiquid"
-if atr/close > max_vol:                return HOLD, "volatility too extreme to size"
-if open_positions >= max_concurrent:   return HOLD, "position limit"
-if data_staleness > 1 session:         return ABSTAIN, "stale data"   # fail loud
+    # ── Hard gates. Preconditions the model cannot see. Checked FIRST.
+    if earnings_within(symbol, cfg.horizon):
+        return HOLD("earnings in N days")
+    if adv_20d(symbol) < cfg.min_liquidity:
+        return HOLD("illiquid")
+    if atr_pct(symbol) > cfg.max_vol:
+        return HOLD("volatility too extreme to size safely")
+    if open_positions() >= cfg.max_concurrent:
+        return HOLD("position limit")
+    if data_staleness(symbol) > 1:
+        return ABSTAIN("stale data")          # ← fail loud, see below
 
-# Short-specific gates (§10.1) — shorting is confirmed in scope, but these
-# three are the difference between a signal and a fillable order
-if side == SHORT:
-    if not instrument.shortable:       return HOLD, "not shortable"
-    if ssr_active:                     return HOLD, "SSR active — needs a limit above the bid"
-    if adv_20d < min_short_liquidity:  return HOLD, "borrow risk: ADV too low to assume easy-to-borrow"
+    # ── Model
+    p_long  = m_long.predict_proba(x)[1]
+    p_short = m_short.predict_proba(x)[1]
 
-# Model
-if p_long >= θ_long and p_long > p_short:    action = LONG
-elif p_short >= θ_short and p_short > p_long: action = SHORT
-else:                                         action = HOLD
+    if p_long >= cfg.theta_long and p_long > p_short:
+        side = Side.LONG
+    elif p_short >= cfg.theta_short and p_short > p_long:
+        side = Side.SHORT
+    else:
+        return HOLD(f"no edge: p_long={p_long:.2f} p_short={p_short:.2f}")
+
+    # ── Short-specific preconditions (§11.1)
+    if side is Side.SHORT:
+        if not instrument(symbol).shortable:
+            return HOLD("not shortable")
+        if ssr_active(symbol, as_of):
+            return HOLD("SSR active — needs a limit order above the bid")
+        if adv_20d(symbol) < cfg.min_short_liquidity:
+            return HOLD("borrow risk: ADV too low")
+
+    # ── Levels: same arithmetic as the labeler, so what you see is
+    #    exactly what the model was trained on
+    atr   = x["atr_14"]
+    entry = last_close(symbol)                     # indicative; real fill is next open
+    sign  = +1 if side is Side.LONG else -1
+    return Decision(
+        side=side, confidence=max(p_long, p_short),
+        entry_ref=entry,
+        tp=entry + sign * cfg.k_tp * atr,
+        sl=entry - sign * cfg.k_sl * atr,
+        shares=int((cfg.risk_frac * equity) / (cfg.k_sl * atr)),
+        rationale=top_contributing_features(x, n=5),
+    )
 ```
 
-`θ_long` and `θ_short` are tuned on **validation folds only** to maximize expectancy
-(not accuracy), then frozen. They are stored with the model artifact — a threshold that
-drifts between runs makes your track record uninterpretable.
+`theta_long` / `theta_short` are tuned on **validation folds only**, to maximize
+expectancy (not accuracy), then **frozen and stored with the model artifact**. A threshold
+that drifts between runs makes your track record uninterpretable.
 
-The **data-staleness ABSTAIN** is deliberate: if the fetch failed and the newest bar is
-three days old, the system must refuse to answer rather than quietly decide on stale
-prices. Silent degradation is the worst failure mode for a tool you check once a day and
-trust.
+> **The `ABSTAIN` on stale data is deliberate.** If the fetch failed and the newest bar is
+> three days old, the system must **refuse to answer** rather than quietly deciding on
+> stale prices. Silent degradation is the worst failure mode for a tool you check once a
+> day and trust. Fail loud.
 
-### Output
+**Output:** a `rich` table on stdout, `reports/decisions_YYYY-MM-DD.{md,csv}`, and a row
+in the `decision` table.
 
-Levels come from the same ATR arithmetic as the labels, so what you see is exactly what
-the model was trained on:
-
-```
-entry_ref = last_close           (indicative; actual fill = next open)
-TP        = entry ± k_tp × ATR14
-SL        = entry ∓ k_sl × ATR14
-shares    = (risk_frac × equity) / (k_sl × ATR14)
-```
-
-Written to: `reports/decisions_YYYY-MM-DD.{md,csv}`, a `rich` table on stdout, and the
-`decision` table in SQLite.
-
-### Scoring yourself — the feature that makes this trustworthy over time
+### Self-scoring — build this early, not last
 
 ```bash
 tdm score-decisions --since 2026-01-01
 ```
 
 Walks every past row in `decision`, resolves it against bars that have since arrived,
-fills `decision_outcome`, and prints realized hit rate / expectancy / drawdown **of the
+fills `decision_outcome`, and reports realized hit rate / expectancy / drawdown **of the
 decisions the system actually issued**.
 
-This is the only genuinely out-of-sample measurement you will ever have — no purging
-subtleties, no leakage, no survivorship. It's also the thing that will tell you if a
-backtest was fooling you. Build it early, not last, and let it accumulate: after six
-months it is worth more than any amount of backtesting.
+**This is the only genuinely out-of-sample measurement you will ever have.** No purging
+subtleties, no leakage, no survivorship bias — just a prediction log and what happened
+next. It's also what will tell you if a backtest was fooling you. Build it in phase 9, not
+at the end, and let it accumulate: after six months it's worth more than any amount of
+backtesting.
 
 ---
 
-## 13. Build order
+## 14. Build order
 
-Each phase ends somewhere useful, so you can stop or re-scope without a half-finished
-system.
+Each phase ends somewhere useful, so you can stop or re-scope without a half-built system.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| **0 · Scaffold** | venv 3.15, `CLAUDE.md`, Makefile, `.gitignore`, CI-less test runner | `make venv && make test` green; venv guard fires outside the venv |
-| **1 · Store + ingest** | schema, migrations, yfinance adapter, incremental sync | `make fetch` twice ⇒ second run makes **zero** HTTP calls; `tdm db verify` clean. **Smoke-test yfinance against pandas 3.1 here** (§1) |
-| **2 · Indicators** | registry + Tier-1/your-list features, Parquet output, CSV export | spot-checks match TradingView; `test_indicators.py` green; correlation report produced |
-| **3 · Structure features** | ZigZag + Dow/Elliott features with `confirmed_at` | `test_leakage.py` pivot tests green |
-| **4 · Labels** | triple barrier, `t1`, weights, `tdm labels sweep` | base rate / holding / ambiguity rate sane across profiles |
-| **5 · Baseline model** | depth-4 decision tree + purged walk-forward CV | the printed rule set is *readable and not absurd* |
+| **0 · Scaffold** | venv 3.15, `CLAUDE.md`, Makefile, test runner | `make venv && make test` green; the venv guard fires outside the venv |
+| **1 · Store + ingest** | schema, migrations, yfinance adapter, sync planner | `make fetch` twice ⇒ **second run makes zero HTTP calls**; `tdm db verify` clean. **Smoke-test yfinance against pandas 3.1 here** (§3) |
+| **2 · Indicators** | registry + Tier-1 + the requested list, Parquet output, CSV export | spot-checks match a charting tool; `test_indicators.py` green; correlation report produced |
+| **3 · Structure features** | ZigZag + Dow/Elliott with `confirmed_at` | `test_leakage.py` pivot tests green |
+| **4 · Labels** | triple barrier, `t1`, weights, `labels sweep` | base rate / holding period / ambiguity rate sane across profiles |
+| **5 · Baseline model** | depth-4 tree + purged walk-forward CV | **the printed rule set is readable and not absurd** |
 | **6 · Workhorse** | HGB + calibration + permutation importance + threshold tuning | beats the depth-4 tree on expectancy, on validation folds |
-| **7 · Backtest** | engine, costs, sensitivity grid, shuffled-signal control | survives 2× slippage; beats shuffled control |
+| **7 · Backtest** | engine, costs, sensitivity grid, shuffled control | survives 2× slippage; beats the shuffled control |
 | **8 · Decide** | `tdm decide`, gates, reports, `decision` table | one command, end to end |
-| **9 · Self-scoring** | `tdm score-decisions` | reproduces phase-7 numbers on the overlap window |
+| **9 · Self-scoring** | `tdm score-decisions` | reproduces phase-7 numbers on the overlapping window |
 | **10 · Holdout** | one single evaluation on the untouched 18 months | **go / no-go** |
 
-Phases 1 and 9 are the two that make this different from the previous repo. If you only
-get through phase 5, you'll still have a clean cached dataset and a readable baseline —
-which is already more than enough to iterate on.
+Phases 1 and 9 are what make this different from the previous attempt. **If you only reach
+phase 5**, you still have a clean cached dataset, a reproducible feature pipeline, and a
+readable baseline — already enough to iterate on.
 
 ---
 
-## 14. Open questions for your review
+## 15. Open questions
 
-1. **Universe.** Keep the previous nine (AMD, AMZN, GOOGL, AAPL, INTC, META, NFLX, NVDA,
-   TSLA)? I'd argue for **expanding to 50–100 liquid names plus sector ETFs** — more
-   independent samples is the cheapest available improvement to statistical power, and
-   it directly dilutes the survivorship problem in §9.5(7). Nine mega-cap tech names are
-   also highly correlated, so your effective sample size is far below 9× one ticker.
-2. **History depth.** 15 years (includes 2015/2018 corrections, the 2020 crash, 2022 bear
-   market — valuable regime diversity) or 10 (more similar to the present regime)? I lean
-   15, with regime features so the model can condition on it.
-3. **TP/SL profile.** Start at TP 2.0 / SL 1.0 / H=10? `tdm labels sweep` will tell us if
-   a different profile has a healthier base rate before we commit.
-4. ~~**Are you actually able to short?**~~ **RESOLVED 2026-11-03: yes.** `M_short` is in
-   scope, and the short-side mechanics — Reg SHO Rule 201, borrow cost, gap-through-stop
-   tail risk — are specified in **§10.1**. Remaining sub-question: do you have a
-   **margin account with easy-to-borrow access** at your broker, and do you know your
-   actual borrow rate? The 0.3%/yr default is reasonable for mega-caps and badly wrong
-   for anything small — it matters once the universe expands (#1).
-5. **Earnings data source.** `yfinance` earnings dates are unreliable and have no
-   as-of history. Options: accept the approximation (documented in §9.5(6)), scrape and
-   snapshot forward from today so the data becomes trustworthy going forward, or pay for
-   a vendor. Given that earnings gaps are the top killer of swing trades, I'd at least
-   start snapshotting from day one — it costs little and compounds.
-6. **Equity / risk-per-trade** for position sizing in the backtest. Defaults: $10,000,
-   1% risk per trade, max 5 concurrent positions.
-7. **Weekly as a separate model?** Current design uses weekly features inside the daily
-   model. The alternative — a dedicated weekly-bar model — gets ~1/5 the samples. I
-   recommend features-only, as designed.
+1. **Universe size.** Keep the previous nine (AMD, AMZN, GOOGL, AAPL, INTC, META, NFLX,
+   NVDA, TSLA)? I'd argue for **50–100 liquid tickers plus sector ETFs.** More independent
+   samples is the cheapest available improvement to statistical power (recall §9: effective
+   sample size is ~2–4k, not 38k), and it directly dilutes the survivorship problem
+   (§10.5 #7). Nine large tech companies are also highly correlated with each other, so the
+   effective sample size is far below 9× one ticker.
+2. **History depth.** 15 years (covers the 2020 crash and the 2022 downturn — valuable
+   diversity of market conditions) or 10 (more similar to now)? I lean 15, with the regime
+   features from §8.2 so the model can condition on it.
+3. **Label profile.** Start at TP 2.0 / SL 1.0 / horizon 10? `tdm labels sweep` (§9) answers
+   this empirically before we commit.
+4. ~~**Can you short?**~~ **Resolved 2026-11-03: yes.** Mechanics in §11.1. Follow-up: do
+   you have **margin + easy-to-borrow access**, and do you know your actual borrow rate?
+   The 0.3%/yr default matters once the universe expands (#1).
+5. **Earnings data source.** `yfinance` earnings dates are unreliable and carry no as-of
+   history (§10.5 #6). Options: accept the approximation, snapshot forward from today so
+   the data becomes trustworthy going forward, or pay a vendor. Given that earnings gaps
+   are the top killer of swing positions, **I'd start snapshotting from day one** — it
+   costs little and compounds.
+6. **Equity and risk-per-trade** for sizing. Defaults: $10,000, 1% risk per trade, max 5
+   concurrent positions.
+7. **Weekly as a separate model?** Current design uses weekly *features* inside the daily
+   model. A dedicated weekly-bar model would get ~1/5 the samples. **Recommend
+   features-only**, as designed.

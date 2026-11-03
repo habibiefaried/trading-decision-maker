@@ -49,8 +49,10 @@ re-run with `./venv/bin/python`.
 ## 2. Read DESIGN.md before changing anything
 
 `DESIGN.md` is the source of truth for architecture and, more importantly, for the
-*reasoning*. It is organized by section (§4 schema, §5 incremental fetch, §7 indicators,
-§8 labeling, §9 validation, §12 decision rule). When you change behaviour, update the
+*reasoning*, and it assumes no finance background — **§2 is a glossary** defining every
+domain term in software terms. Organized by section (§5 schema, §6 price adjustment,
+§7 incremental fetch, §8 indicators, §9 labeling, §10 validation, §13 decision rule).
+When you change behaviour, update the
 relevant section in the same commit.
 
 `README.md` is for script/command usage only — no design discussion there.
@@ -61,24 +63,24 @@ Each of these has burned this class of project before. DESIGN.md explains why.
 
 1. **Never store adjusted prices.** `bar_daily` holds raw, unadjusted OHLCV; adjustment
    is applied at read time from `corporate_action`. Splits rewrite adjusted history
-   retroactively, so a cache of adjusted closes goes silently stale. (§4)
+   retroactively, so a cache of adjusted closes goes silently stale. (§6)
 2. **Never fetch a date range already covered.** Go through `ingest/sync.py`, which
    consults `fetch_coverage` and `known_gap`. Fetching twice is the bug this repo
-   exists to avoid. (§5)
+   exists to avoid. (§7)
 3. **No lookahead, ever.** A feature on date *d* may only use bars up to and including
    *d*. In particular: ZigZag pivots must respect `confirmed_at`; weekly features must
    use the last *completed* weekly bar; z-scores and percentile ranks use trailing
-   windows only (never `fit()` on the full series). (§7.5, §9.5)
+   windows only (never `fit()` on the full series). (§8.5, §10.5)
 4. **Never use plain `KFold` / `train_test_split`.** Use
    `model/cv.py::PurgedWalkForwardSplit`. Labels span up to H future bars, so ordinary
-   CV leaks test prices into training labels and every metric comes out inflated. (§9.3)
+   CV leaks test prices into training labels and every metric comes out inflated. (§10.3)
 5. **Don't touch the holdout window.** The final ~18 months require an explicit
    `--unlock-holdout` flag. No hyperparameter search, feature selection, or threshold
-   tuning against it. (§9.3)
+   tuning against it. (§10.3)
 6. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in
-   both the labeler and the backtest. The two must never disagree. (§8, §10)
+   both the labeler and the backtest. The two must never disagree. (§9, §11)
 7. **Report expectancy, not accuracy.** At 2:1 R:R, break-even is a ~33% hit rate, so
-   accuracy is close to meaningless here. (§9.4)
+   accuracy is close to meaningless here. (§10.4)
 
 ## 4. pandas 3.x gotchas
 

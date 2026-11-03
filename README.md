@@ -117,5 +117,5 @@ make lint
 ## Disclaimer
 
 Research and decision-support tooling. It does not place orders and it is not
-financial advice. Read [DESIGN.md §11](DESIGN.md) for what results to realistically
+financial advice. Read [DESIGN.md §12](DESIGN.md) for what results to realistically
 expect before trading on anything this produces.
