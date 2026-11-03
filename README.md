@@ -118,7 +118,7 @@ make decide
 
 | File | Purpose |
 |---|---|
-| `config/universe.txt` | **your** tickers, one per line, any number. Benchmarks (SPY etc.) added automatically |
+| `config/universe.txt` | **your** tickers, one per line, any number. Stocks only — no ETFs needed |
 | `config/config.toml` | horizon, ATR multiples, costs, thresholds, position sizing |
 | `config/feature_sets/*.toml` | which indicators to compute |
 

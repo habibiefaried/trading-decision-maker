@@ -34,7 +34,7 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 
 | Setting | Value |
 |---|---|
-| Market | US stocks (no ETFs as trading candidates) |
+| Market | US stocks — liquid, well-known names (MSFT, NVDA, …). No ETFs |
 | Universe | ~15 tickers you supply (any size you like — §5) |
 | Data source | `yfinance`, daily bars, 9 years |
 | Execution venue | IQ Option stock CFDs, 10× leverage |
@@ -89,7 +89,7 @@ works.
 | **Bar** | One row of data for one ticker for one day. |
 | **OHLCV** | The 5 numbers in a bar: **O**pen (first trade price of the day), **H**igh, **L**ow, **C**lose (last trade price), **V**olume (shares traded). That's the entire raw input. |
 | **Session** | One trading day. The US market is open weekdays minus ~10 holidays, so "yesterday" and "the previous session" differ — you need a calendar library to know which. |
-| **ETF** | A ticker representing a basket of stocks. `SPY` tracks the 500 largest US companies, so it's a one-number proxy for "the market". |
+| **Index** | A calculated number tracking a group of stocks. `^GSPC` is the S&P 500 index — a one-number proxy for "the US market". `^VIX` tracks expected volatility. Indices aren't traded; we read them only as reference data (§6.3). |
 | **ADV** | Average Daily Volume. Low ADV means you can't buy or sell without moving the price yourself. |
 
 ### The actions
@@ -245,7 +245,7 @@ trading-decision-maker/
 ├── requirements.txt
 │
 ├── config/
-│   ├── universe.txt             # your tickers, one per line
+│   ├── universe.txt             # your tickers, one per line (MSFT, NVDA, …)
 │   ├── config.toml              # horizons, ATR multiples, costs, account (§14)
 │   └── feature_sets/
 │       ├── minimal.toml         # 18 features — the default at ~15 tickers (§6.3)
@@ -269,7 +269,7 @@ trading-decision-maker/
 │   │   ├── volatility.py        #    ATR, Bollinger, Keltner, Donchian
 │   │   ├── volume.py            #    OBV, MFI, VWAP variants
 │   │   ├── structure.py         #    ZigZag pivots -> Dow/Elliott features (§6.4)
-│   │   ├── market.py            #    relative strength vs SPY, market regime
+│   │   ├── market.py            #    relative strength vs ^GSPC, market regime
 │   │   └── pipeline.py          #    orchestrate, normalize, write Parquet
 │   │
 │   ├── dataset/
@@ -419,10 +419,13 @@ UNH
 ...
 ```
 
-**Benchmarks are appended automatically.** The relative-strength and market-regime features
-(§6.3) need SPY and sector ETFs, so `fetch` adds them and tags them `tradeable=False`. They
-flow through features like any other series and are filtered out at the decision step
-(§11). You list only what you want to trade.
+**Reference series are fetched separately and never traded.** The relative-strength and
+regime features (§6.3) need a market series to compare against, so `fetch` also downloads
+`^GSPC` (the S&P 500 **index** — not an ETF) and `^VIX`. These are not part of your
+universe: they produce no rows in the dataset, get no decisions, and appear nowhere in the
+output. They exist purely as inputs to a handful of feature columns.
+
+`universe.txt` is therefore exactly and only the list of things you want to trade.
 
 ### How universe size affects what you can conclude
 
@@ -455,8 +458,8 @@ number governs how many features you can use and how much the final verdict is w
 > ⚠️ **Below ~10 tickers, the cross-sectional features degenerate.** `rs_rank` is a
 > percentile *across the universe* on each day — with 2 tickers it can only ever be 0 or 1,
 > and with 1 it's a constant. Same for `breadth_above_ema50`. The feature registry drops
-> both automatically when `len(universe) < 10` and logs that it did. `rs_spy_63` still
-> works at any size, since it's measured against SPY rather than against peers — so you
+> both automatically when `len(universe) < 10` and logs that it did. `rs_mkt_63` still
+> works at any size, since it's measured against `^GSPC` rather than against peers — so you
 > don't lose relative strength entirely, just the cross-sectional ranking of it.
 
 If you want to add tickers later, do it — more is strictly better for the statistics, and
@@ -605,25 +608,45 @@ If a candidate feature doesn't help answer one of those, it shouldn't be in the 
 
 #### 2 · RELATIVE STRENGTH & MARKET REGIME
 
-Computed against SPY and sector ETFs, which are fetched but never traded (§5).
+Computed against the **market index** (`^GSPC`) and the **peer median** of your own
+universe. No ETFs involved — see the box below.
 
 | Feature | Params | Stored as | Warm-up | Tier |
 |---|---|---|---|---|
-| `rs_spy_21/63` | 21, 63 | ROC of `(close/SPY)` | 63 | **MIN** |
-| `rs_spy_126` | 126 | same | 126 | EXT |
-| `rs_rank` | 63 | **cross-sectional percentile** of `rs_spy_63` across the universe, per day | 63 | **MIN** |
-| `rs_sector_63` | 63 | ROC of `(close/sector ETF)` | 63 | EXT |
-| `beta_spy_63` | 63 | regression beta | 63 | EXT |
-| `corr_spy_63` | 63 | correlation −1..1 ✓ | 63 | EXT |
-| `spy_above_ema200` | 200 | 0/1 | 200 | **MIN** |
-| `spy_vol_rank` | 21, 252 | percentile of SPY realized vol | 252 | **CORE** |
+| `rs_mkt_21/63` | 21, 63 | ROC of `(close / ^GSPC)` | 63 | **MIN** |
+| `rs_mkt_126` | 126 | same | 126 | EXT |
+| `rs_rank` | 63 | **cross-sectional percentile** of `rs_mkt_63` across the universe, per day | 63 | **MIN** |
+| `rs_peer_63` | 63 | ROC of `(close / median of your universe)` | 63 | EXT |
+| `beta_mkt_63` | 63 | regression beta | 63 | EXT |
+| `corr_mkt_63` | 63 | correlation −1..1 ✓ | 63 | EXT |
+| `mkt_above_ema200` | 200 | 0/1 | 200 | **MIN** |
+| `mkt_vol_rank` | 21, 252 | percentile of `^GSPC` realized vol | 252 | **CORE** |
 | `vix_rank` | 252 | percentile of VIX | 252 | **CORE** |
 | `vix_level` | — | raw | 1 | EXT |
 | `vix_term_structure` | — | VIX3M / VIX — below 1 signals stress | 1 | EXT |
 | `breadth_above_ema50` | 50 | fraction of universe above own EMA50 | 50 | EXT |
 
-> `rs_rank` is the only feature needing the **whole universe at once** rather than one
-> ticker at a time — it's a cross-sectional rank per day. That breaks the otherwise
+> #### Reference series — not part of your universe
+>
+> Two of these features compare a stock against "the market", which needs a market series
+> to compare against. That series is the **S&P 500 index, `^GSPC`** — an index, not an ETF.
+> `^VIX` likewise. They are **reference data only**: downloaded, used to compute columns,
+> and never traded, never scored, never rows in the dataset (§8.1).
+>
+> This matters because without a market series you lose the entire RELATIVE family —
+> including `rs_rank`, which is the single strongest daily-horizon feature in published
+> equity work, and `mkt_above_ema200`, which is the regime split long and short setups
+> behave most differently across. Three of the 18 `minimal` features are in this family.
+>
+> **For sector-style comparison the design uses the peer median of your own universe** —
+> the equal-weighted median return of the tickers you chose. No extra downloads, and it
+> adapts to whatever list you run. ⚠️ With ~15 tickers that median is noisy, which is why
+> `rs_peer_63` and `dow_peer_confirm` are both EXTENDED rather than MIN.
+>
+> Two practical notes: `^VIX` has **no volume** (it's a calculated index, not a traded
+> instrument), so only its price is usable — fine, since that's all these features need.
+> And `rs_rank` is the only feature needing the **whole universe at once** rather than one
+> ticker at a time, since it's a cross-sectional rank per day; that breaks the otherwise
 > per-ticker shape of the pipeline, and the groupby is easy to get wrong.
 
 #### 3 · MOMENTUM / MEAN REVERSION
@@ -749,7 +772,7 @@ def pivots(bars, threshold) -> list[Pivot]:
 | `dow_mtf_agree` | `dow_trend == dow_trend_major` — Dow's primary-vs-secondary trend idea | EXT |
 | `swing_hh/hl/lh/ll` | 4 booleans on the latest completed leg | EXT |
 | `dow_volume_confirm` | `+1` if volume expands with the trend and contracts against it | EXT |
-| `dow_sector_confirm` | ticker trend == sector ETF trend | EXT |
+| `dow_peer_confirm` | ticker `dow_trend` == peer-median `dow_trend` | EXT |
 | `leg_retrace_ratio` | current leg's retracement of the previous, as a fraction | EXT |
 | `fib_zone` | ordinal band: <.236 / .236–.382 / .382–.5 / .5–.618 / .618–.786 / >.786 | EXT |
 | `leg_extension_ratio` | current leg ÷ previous leg | EXT |
@@ -822,7 +845,7 @@ each family — enough to answer all six questions above with the fewest columns
 > 3. **`ema_stack`** — cheap, robust summary of multi-timeframe trend agreement.
 > 4. **`atr_pct_rank`** — volatility regime; gates sizing and flags when barriers are
 >    unusually wide.
-> 5. **`spy_above_ema200`** — long and short setups behave completely differently either
+> 5. **`mkt_above_ema200`** — long and short setups behave completely differently either
 >    side of this line.
 
 ### 6.4 Redundancy
@@ -970,7 +993,6 @@ One row per `(symbol, date)`, written to Parquet, exportable to CSV.
   fwd_mae_10d             float      max ADVERSE excursion ÷ ATR
 
 ┌─ META ───────────────────────────────── bookkeeping, never features ─┐
-  meta_tradeable          bool       False for SPY and sector ETFs (§5)
   meta_gate_pass          bool       passed the §11 hard gates (§9.1)
   meta_run_id             str        provenance (§5)
 ```
@@ -1432,7 +1454,7 @@ probability as a confidence number and "0.71" needs to actually mean 71%. Calibr
 | Max drawdown, Calmar | whether you could actually tolerate it |
 | Sharpe / Sortino | risk-adjusted, comparable to doing nothing |
 | Trade count | **fewer than ~100 holdout trades ⇒ your estimate is noise** |
-| **vs. buy-and-hold SPY over the same window** | the benchmark that counts. Beating a coin flip isn't the bar; beating "do nothing and own the index" is |
+| **vs. buy-and-hold `^GSPC` over the same window** | the benchmark that counts. Beating a coin flip isn't the bar; beating "do nothing and own the index" is |
 
 **Report the distribution across folds, never just the mean.** A strategy that was
 excellent 2019–2021 and flat since has a fine average and is untradeable.
@@ -1665,8 +1687,6 @@ def decide(symbol: str, as_of: date) -> Decision:
     x = features.load(symbol, as_of)      # from Parquet, not recomputed
 
     # ── Hard gates. Preconditions the model cannot see. Checked FIRST.
-    if not universe.is_tradeable(symbol):
-        return SKIP("data-only instrument (ETF/benchmark)")
     if data_staleness(symbol) > 1:
         return ABSTAIN("stale data")          # ← fail loud, see below
     if adv_20d(symbol) < cfg.min_liquidity:
@@ -1834,8 +1854,12 @@ charts of every ticker — a useful analysis tool on its own, independent of any
 
 [universe]
 file        = "config/universe.txt"   # your tickers — any number (§5)
-benchmark   = "SPY"                   # appended automatically, tradeable=false
 years       = 9
+
+[reference]                           # fetched for features only, never traded (§6.3)
+market      = "^GSPC"                 # S&P 500 INDEX, not an ETF
+volatility  = "^VIX"                  # no volume; price only
+peer_proxy  = "universe_median"       # sector comparison, from your own tickers
 
 [labels]                              # the "label profile" — hashed into run_id
 k_tp        = 2.0                     # take-profit, in ATR
