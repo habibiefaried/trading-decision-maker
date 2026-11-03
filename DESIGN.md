@@ -1029,8 +1029,9 @@ for each session d in the test window:
 |---|---|---|
 | Commission | $0 + $0.005/share | typical US retail |
 | Slippage | 0.05 × ATR per side | volatility-scaled, not fixed bps |
-| Short borrow | 0.3%/yr on easy-to-borrow | hard-to-borrow is far worse; flag it |
+| Short borrow | 0.3%/yr on easy-to-borrow | accrued daily on open shorts; see §10.1 |
 | Short availability | assume unavailable if `instrument.shortable = 0` | |
+| Short entry blocked by SSR | skip the entry (don't fill at a worse price) | **§10.1** — this one materially changes short-side results |
 
 **Required sensitivity runs.** A single backtest number is not evidence. Report the grid:
 2× slippage, 2× commission, entry delayed one more bar, TP/SL multiples ±25%, horizon
@@ -1038,6 +1039,62 @@ for each session d in the test window:
 it had a cost assumption. Also run the **randomized-signal control**: shuffle the
 predictions and re-backtest; if random does comparably, the model contributes nothing and
 the equity curve is measuring your position sizing.
+
+### 10.1 Short-side mechanics (confirmed in scope)
+
+You've confirmed you can short, so `M_short` is in. Shorting is not a sign flip on
+longs, and the asymmetries below are modeled explicitly rather than left for you to
+remember at the terminal.
+
+> #### ⚠️ Reg SHO Rule 201 — the short-side constraint that actually bites
+>
+> The SEC's **alternative uptick rule** triggers when a stock declines **10% or more
+> from the prior day's close**. Once triggered, short sales may only be effected at a
+> price **above the current national best bid**, for the remainder of that day **and
+> the entire following day**.
+>
+> **Why this is a real problem for this specific system, not a footnote:** a
+> mean-reversion or breakdown-continuation short signal fires precisely *after* a sharp
+> down day. That is exactly when SSR is active. So the setups the model most wants to
+> short are disproportionately the ones you cannot get filled on at market — and since
+> we enter at `open[t+1]`, a restricted open means a short-at-market order simply does
+> not execute at the price the backtest assumed.
+>
+> If you ignore this, the backtest cheerfully books the best short entries in the
+> dataset and live trading silently skips them. That single discrepancy could account
+> for most of the gap between a good short backtest and a bad short track record.
+>
+> **Handling:** derive `ssr_active[t]` from the stored bars — true if
+> `low[t] <= 0.90 × close[t-1]` (triggered today, restricted today + tomorrow) or if it
+> triggered on `t-1`. Then:
+> - **As a hard gate (§12):** if `ssr_active`, do not issue a market short. Report
+>   `HOLD — SSR active` so you can place a limit order above the bid manually if you
+>   want the trade.
+> - **As a backtest rule:** skip the entry entirely rather than filling it at a worse
+>   price. Skipping is the honest model of "my market order didn't fill"; a fudged worse
+>   fill invents a trade that wouldn't have happened.
+> - **As a feature:** `ssr_active` and `days_since_ssr` go into the matrix, since
+>   "recently fell 10% in a day" is genuine regime information for both sides.
+>
+> Note this is derived from daily OHLC, so it's an approximation — the true trigger is
+> an intraday print against the prior official close, and halts complicate it. It will
+> be close enough to matter and not exact. Document it as such.
+
+Other short-side asymmetries:
+
+| Item | Treatment |
+|---|---|
+| **Borrow cost** | Accrued daily on open shorts, inside `net_return` (§8), not bolted on afterward. Default 0.3%/yr; fine for the mega-caps in your universe, wildly optimistic for small caps. If the universe expands (§14 #1), this assumption needs revisiting. |
+| **Hard-to-borrow / recall** | Can't be reconstructed historically without a vendor borrow-rate feed. Treated as a known unmodeled risk: the backtest assumes every short is borrowable, which is optimistic. Mitigate by restricting shorts to high-ADV names via the liquidity gate. |
+| **Unbounded loss tail** | A stop caps your loss only if price passes *through* it. A short that gaps up 30% overnight on a buyout rumor fills far above the stop. The pessimistic same-bar rule (§8) already handles intrabar ambiguity, but **gap-through-stop is a separate, real tail** — report short-side max single-trade loss separately from the aggregate drawdown, so one outlier can't hide in the average. |
+| **Earnings gates matter more** | The earnings gate (§12) is doubly important for shorts: an upside earnings gap is the canonical way a short blows through its stop. |
+| **Margin** | Shorting requires a margin account and ties up maintenance margin, so a short position consumes more buying power than a long of the same notional. Position sizing (§10) uses the same fixed-fractional risk for both; if margin ever becomes the binding constraint, that's a sizing change, not a model change. |
+
+**Evaluate the two sides separately.** All of §9.4's metrics are reported per side, never
+pooled. Pooling hides the most likely outcome — that longs carry a modest edge and shorts
+carry none — behind a mediocre blended number. §11's warning stands: if `M_short` shows
+no out-of-sample edge, shipping long/flat is the correct response, and now it's a
+measured decision rather than an assumption.
 
 ---
 
@@ -1080,11 +1137,17 @@ p_short = M_short.predict_proba(x)[1]
 
 # Hard gates — these override the model, because the model cannot see them
 if earnings_within(horizon_days):      return HOLD, "earnings in N days"
-if not instrument.shortable and side == SHORT: return HOLD, "not shortable"
 if adv_20d < min_liquidity:            return HOLD, "illiquid"
 if atr/close > max_vol:                return HOLD, "volatility too extreme to size"
 if open_positions >= max_concurrent:   return HOLD, "position limit"
 if data_staleness > 1 session:         return ABSTAIN, "stale data"   # fail loud
+
+# Short-specific gates (§10.1) — shorting is confirmed in scope, but these
+# three are the difference between a signal and a fillable order
+if side == SHORT:
+    if not instrument.shortable:       return HOLD, "not shortable"
+    if ssr_active:                     return HOLD, "SSR active — needs a limit above the bid"
+    if adv_20d < min_short_liquidity:  return HOLD, "borrow risk: ADV too low to assume easy-to-borrow"
 
 # Model
 if p_long >= θ_long and p_long > p_short:    action = LONG
@@ -1170,9 +1233,12 @@ which is already more than enough to iterate on.
    15, with regime features so the model can condition on it.
 3. **TP/SL profile.** Start at TP 2.0 / SL 1.0 / H=10? `tdm labels sweep` will tell us if
    a different profile has a healthier base rate before we commit.
-4. **Are you actually able to short?** This determines whether `M_short` is worth
-   building at all. If your account is cash-only, we'd ship long/flat and spend that
-   effort on better long entries instead — which, per §11, may well be where the edge is.
+4. ~~**Are you actually able to short?**~~ **RESOLVED 2026-11-03: yes.** `M_short` is in
+   scope, and the short-side mechanics — Reg SHO Rule 201, borrow cost, gap-through-stop
+   tail risk — are specified in **§10.1**. Remaining sub-question: do you have a
+   **margin account with easy-to-borrow access** at your broker, and do you know your
+   actual borrow rate? The 0.3%/yr default is reasonable for mega-caps and badly wrong
+   for anything small — it matters once the universe expands (#1).
 5. **Earnings data source.** `yfinance` earnings dates are unreliable and have no
    as-of history. Options: accept the approximation (documented in §9.5(6)), scrape and
    snapshot forward from today so the data becomes trustworthy going forward, or pay for
