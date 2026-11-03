@@ -70,7 +70,7 @@ Worth stating up front, because they drive most of the design decisions:
 | Both directions? | **Yes.** CFDs make shorting trivial | §11.1 |
 | Weekly-timeframe features | **Dropped** | User's call; removes a whole class of leakage bug |
 | Earnings-date data | **Optional, default off** | OHLCV-only is the v1 target. ⚠️ But see the leverage warning in §11.1 |
-| Python | 3.15 | |
+| Python | **3.14** | Changed from 3.15: CatBoost has no cp315 wheel — §3 |
 
 ---
 
@@ -146,37 +146,43 @@ Every domain term in this document, defined once. Skim it now, refer back as nee
 
 ---
 
-## 3. Environment: Python 3.15 + venv
+## 3. Environment: Python 3.14 + venv
 
 ### Verified package availability
 
-A brand-new Python usually means missing binary wheels in the scientific stack, so I
-checked PyPI wheel tags rather than assuming:
+Checked against PyPI wheel tags rather than assumed. Every package below has a `cp314`
+wheel or is pure-Python:
 
-| Package | Version | `cp315` wheel | Role |
-|---|---|---|---|
-| numpy | 2.5.4 | ✅ | arrays |
-| pandas | 3.1.0 | ✅ | dataframes — **major version, breaking, see below** |
-| scikit-learn | 1.9.1 | ✅ | models, CV |
-| TA-Lib (`ta-lib`) | 0.8.3 | ✅ | indicator library (C, Cython-wrapped). Wheels are self-contained — no `brew install ta-lib` |
-| pyarrow | 26.0.1 | ✅ | Parquet I/O |
-| matplotlib | 3.11.2 | ✅ | plots |
-| yfinance | 1.7.0 | ✅ (pure-py) | data source |
-| exchange-calendars | 4.13.2 | ✅ (pure-py) | which days the market is open |
-| xgboost | 3.4.1 | ✅ | optional alternative model |
-| shap | 0.54.1 | ✅ | optional model explanation |
+| Package | Version | Role |
+|---|---|---|
+| numpy | 2.5.4 | arrays |
+| pandas | 3.1.0 | dataframes — **major version, breaking, see below** |
+| scikit-learn | 1.9.1 | RandomForest, HistGradientBoosting, CV, calibration |
+| **catboost** | **1.2.10** | **primary model (§10.1)** — macOS wheels are `universal2`, so Apple Silicon is covered |
+| xgboost | 3.4.1 | alternative, for monotonic constraints |
+| TA-Lib (`ta-lib`) | 0.8.3 | indicator engine (C, Cython-wrapped). Wheels self-contained — no `brew install ta-lib` |
+| plotly | 7.1.0 | interactive HTML charts (§7) |
+| pyarrow | 26.0.1 | Parquet snapshots |
+| yfinance | 1.7.0 | data source |
+| exchange-calendars | 4.13.2 | market session calendar |
+| shap | 0.54.1 | model explanation (optional) |
+| typer / rich / pydantic-settings / pytest | — | CLI, output, config, tests |
 
-### Two popular packages are ruled out by Python 3.15
+### Why 3.14 and not 3.15
 
-Both would be natural choices; neither can be installed. Worth knowing before someone
-spends an afternoon on it:
+The project originally targeted 3.15. **CatBoost ships wheels only up to `cp314`** — there
+is an sdist, but CatBoost builds from source through its own toolchain and that is a
+genuinely painful afternoon. Since CatBoost is the primary model (§10.1) and 3.14 is
+stable with every other dependency available, 3.14 is the version.
 
-- **`pandas-ta`** (a popular pure-Python indicator library) **cannot install at all.** It
-  hard-pins `numba==0.61.2`, and that numba version publishes wheels only up to `cp313`.
-  → **Use TA-Lib**, which is faster anyway.
-- **`vectorbt`** (a backtesting framework) declares `requires-python <3.15`.
-  → **Write our own** (§12). We'd want to regardless — see the "two implementations must
-  agree" problem in §1, which a third-party framework would make worse, not better.
+Nothing in the design depended on 3.15; it was a preference, not a requirement.
+
+**Still ruled out on 3.14:**
+
+| Package | Why |
+|---|---|
+| `pandas-ta` | pins `numba==0.61.2`, which has no `cp314` wheel either. **TA-Lib** instead — faster anyway (Cython, 2–4× the old SWIG bindings). |
+| `vectorbt` | *Technically installable* on 3.14 (`requires-python <3.15`), but still **not used** — §11 explains why: the §9 labeler already defines the exit logic, and a second framework-provided implementation of it would be a second thing to keep in sync. One implementation, shared. |
 
 ### pandas 3.x is a breaking release
 
@@ -198,9 +204,9 @@ Code copied from the user's previous project (which used pandas 2.x) will break:
 ### venv, enforced three ways
 
 Everything runs in `./venv`. Enforced redundantly, because on this machine bare `python3`
-is pyenv 3.13.1 and `/opt/homebrew/bin/python3` is 3.14 — both wrong:
+is pyenv 3.13.1 — the wrong interpreter:
 
-1. **`.python-version`** → `3.15`
+1. **`.python-version`** → `3.14`
 2. **`CLAUDE.md`** → explicit instructions for AI agents working in the repo
 3. **A runtime guard** in `src/tdm/__init__.py`:
 
@@ -222,8 +228,8 @@ fails loudly at import time.
 Setup:
 
 ```bash
-brew install python@3.15                  # provides 3.15.2
-/opt/homebrew/bin/python3.15 -m venv venv
+brew install python@3.14                  # already installed on this machine
+/opt/homebrew/bin/python3.14 -m venv venv
 ./venv/bin/python -m pip install -U pip
 ./venv/bin/pip install -r requirements.txt
 ```
@@ -250,7 +256,7 @@ test lint
 
 ```
 trading-decision-maker/
-├── .python-version              # 3.15
+├── .python-version              # 3.14
 ├── CLAUDE.md                    # rules for AI agents working here
 ├── DESIGN.md                    # this file — the "why"
 ├── README.md                    # the "how to run" only
@@ -545,7 +551,7 @@ tdm chart --ticker NVDA --with-labels    # overlay the triple-barrier outcomes
 tdm chart --ticker NVDA --with-decisions # overlay the model's calls
 ```
 
-**Library: Plotly** (7.1.0, pure-Python, works on 3.15). `go.Candlestick` +
+**Library: Plotly** (7.1.0, pure-Python). `go.Candlestick` +
 `make_subplots` + `write_html` gives one self-contained file with zoom, pan and hover
 tooltips, no server and no build step. Bokeh is comparable; `lightweight-charts` looks
 more like TradingView but needs JS plumbing; matplotlib/mplfinance give static PNGs, which
@@ -630,6 +636,211 @@ how you sanity-check §9 by eye:
 ---
 
 ## 8. Feature engineering
+
+### 8.0 The complete feature list
+
+Everything the system computes, in one place. Scattered across §8.1–§8.4 below is the
+*reasoning*; this is the build spec.
+
+#### The swing-trading logic these features serve
+
+The list isn't a grab bag — it exists to answer six questions in sequence, which is what
+a swing trade actually is:
+
+```
+1. Is this stock trending?                → TREND        (is there anything to ride?)
+2. Is it stronger than the market?        → RELATIVE      (is it the best horse?)
+3. Has it pulled back enough to enter?    → MOMENTUM      (entry timing)
+4. Is volume confirming the move?         → VOLUME        (is the move real?)
+5. Is volatility sane enough to size it?  → VOLATILITY    (can I risk-manage it?)
+6. Is the market regime favourable?       → MARKET        (should I be trading at all?)
+```
+
+Each family maps to one question. If a candidate feature doesn't help answer one of them,
+it probably shouldn't be in the list.
+
+> #### ⚠️ Start with the CORE set, not all of it
+>
+> The full list is **~115 features**. Against ~11,350 effective samples (§10.1) that's
+> ~100 samples per feature — thin, and a direct invitation to overfit.
+>
+> So the list is split into **CORE (38)** and **EXTENDED (~77)**. Build and validate CORE
+> first (phase 2), and only add EXTENDED features once CORE shows signal above base rate.
+> If CORE shows nothing, more features will not rescue it — they'll just make the
+> overfitting harder to detect.
+>
+> `config/feature_sets/core.toml` and `extended.toml` select between them.
+
+#### 1 · TREND — "is there anything to ride?"
+
+| Feature | Params | Stored as | Warm-up | Tier |
+|---|---|---|---|---|
+| `close_vs_ema8/21/50/200` | 8, 21, 50, 200 | `close/EMA − 1` | 200 | **CORE** (21, 50, 200) |
+| `ema_stack` | 8/21/50/200 | ordinal 0–4: how many are in ascending order | 200 | **CORE** |
+| `ema21_slope_atr` | 21, 5-bar slope | slope ÷ ATR | 26 | **CORE** |
+| `ema_cross_age` | 8×21 | signed bars since last cross | 21 | EXT |
+| `adx_14` | 14 | raw 0–100 ✓ | 28 | **CORE** |
+| `di_diff` | 14 | `(+DI − −DI)` | 28 | **CORE** |
+| `aroon_up/down/osc` | 25 | raw 0–100 ✓ | 25 | EXT |
+| `supertrend_state` | 10, 3×ATR | −1 / +1 | 24 | **CORE** |
+| `supertrend_dist_atr` | 10, 3×ATR | distance to flip ÷ ATR | 24 | EXT |
+| `ichimoku_tenkan/kijun_pos` | 9, 26 | `close/line − 1` | 52 | EXT |
+| `ichimoku_cloud_pos` | 9,26,52 | above / inside / below (ordinal) | 78 | EXT |
+| `ichimoku_cloud_thick_atr` | 9,26,52 | thickness ÷ ATR | 78 | EXT |
+| `linreg_slope_atr_21/63` | 21, 63 | regression slope ÷ ATR | 63 | EXT |
+| `linreg_r2_21/63` | 21, 63 | R² 0–1 ✓ — *trend quality*, not direction | 63 | EXT |
+
+#### 2 · RELATIVE STRENGTH & MARKET REGIME — "best horse? should I trade at all?"
+
+Computed against SPY and sector ETFs, which are fetched but never traded (§6).
+
+| Feature | Params | Stored as | Warm-up | Tier |
+|---|---|---|---|---|
+| `rs_spy_21/63/126` | 21, 63, 126 | ROC of (close/SPY) | 126 | **CORE** (21, 63) |
+| `rs_rank` | 63 | **cross-sectional percentile** of `rs_spy_63` across the universe, per day | 63 | **CORE** |
+| `rs_sector_63` | 63 | ROC of (close/sector ETF) | 63 | EXT |
+| `beta_spy_63` | 63 | regression beta | 63 | EXT |
+| `corr_spy_63` | 63 | correlation −1..1 ✓ | 63 | EXT |
+| `spy_above_ema200` | 200 | 0/1 | 200 | **CORE** |
+| `spy_vol_rank` | 21, 252 | percentile of SPY realized vol | 252 | **CORE** |
+| `vix_level`, `vix_rank` | 252 | raw, and percentile | 252 | **CORE** (`vix_rank`) |
+| `vix_term_structure` | — | VIX3M / VIX — <1 signals stress | 1 | EXT |
+| `breadth_above_ema50` | 50 | fraction of universe above own EMA50 | 50 | EXT |
+
+> `rs_rank` is the one feature here that needs the **whole universe at once** rather than
+> one ticker at a time — it's a cross-sectional rank. Worth noting because it makes the
+> feature pipeline not purely per-ticker, and it's easy to get the groupby wrong.
+
+#### 3 · MOMENTUM / MEAN REVERSION — "entry timing"
+
+| Feature | Params | Stored as | Warm-up | Tier |
+|---|---|---|---|---|
+| `rsi_14` | 14 | raw 0–100 ✓ | 14 | **CORE** |
+| `rsi_2` | 2 | raw 0–100 ✓ — short-term pullback depth | 2 | **CORE** |
+| `rsi_divergence` | from pivots | −1 / 0 / +1 (§8.4) | ~60 | EXT |
+| `stoch_k`, `stoch_d` | 14,3,3 | raw 0–100 ✓ | 17 | **CORE** |
+| `stoch_kd_diff` | 14,3,3 | `%K − %D` | 17 | EXT |
+| `macd_hist_atr` | 12,26,9 | histogram ÷ ATR | 35 | **CORE** |
+| `macd_line_atr`, `macd_signal_atr` | 12,26,9 | ÷ ATR | 35 | EXT |
+| `macd_cross_age` | 12,26,9 | signed bars since cross | 35 | EXT |
+| `ppo` | 12,26 | `(EMA12−EMA26)/EMA26 × 100` — **inherently scale-free**, a cleaner MACD | 26 | EXT |
+| `roc_5/10/21/63` | 5,10,21,63 | percentage ✓ | 63 | **CORE** (21, 63) |
+| `cci_20` | 20 | raw ✓ | 20 | EXT |
+| `williams_r_14` | 14 | raw −100..0 ✓ | 14 | EXT |
+
+#### 4 · VOLATILITY — "can I size this safely?"
+
+| Feature | Params | Stored as | Warm-up | Tier |
+|---|---|---|---|---|
+| `atr_pct` | 14 | `ATR/close` | 14 | **CORE** |
+| `atr_pct_rank` | 14, 252 | trailing percentile | 252 | **CORE** |
+| `bb_pctb` | 20, 2σ | `(C−lower)/(upper−lower)` | 20 | **CORE** |
+| `bb_bandwidth` | 20, 2σ | `(upper−lower)/mid` | 20 | **CORE** |
+| `bb_bandwidth_rank` | 20, 252 | percentile — low = squeeze | 252 | **CORE** |
+| `keltner_pos` | 20, 2×ATR10 | position in channel | 20 | EXT |
+| `squeeze_on` | BB vs Keltner | 0/1 — BB inside Keltner | 20 | EXT |
+| `donchian_pos_20/55` | 20, 55 | position in channel 0–1 ✓ | 55 | **CORE** (20) |
+| `pct_from_52w_high` | 252 | `close/max(high,252) − 1` | 252 | **CORE** |
+| `pct_from_52w_low` | 252 | `close/min(low,252) − 1` | 252 | EXT |
+| `realized_vol_21` | 21 | stdev of log returns, annualized | 21 | EXT |
+| `parkinson_vol_21` | 21 | high/low range estimator — **more efficient than close-to-close**, which matters when you only have 9 years | 21 | EXT |
+| `vol_of_vol` | 21, 63 | stdev of `atr_pct` | 63 | EXT |
+
+#### 5 · VOLUME — "is the move real?"
+
+| Feature | Params | Stored as | Warm-up | Tier |
+|---|---|---|---|---|
+| `volume_rel_median` | 20 | `log(volume / median20)` | 20 | **CORE** |
+| `volume_z` | 63 | trailing z-score | 63 | EXT |
+| `obv_slope_z` | 21 slope, 252 z | ⚠️ never raw OBV (§8.1 #6) | 252 | **CORE** |
+| `obv_price_divergence` | 21 | sign disagreement between OBV slope and price slope | 252 | EXT |
+| `mfi_14` | 14 | raw 0–100 ✓ — volume-weighted RSI | 14 | **CORE** |
+| `ad_slope_z` | 21, 252 | Chaikin A/D line slope, z-scored | 252 | EXT |
+| `cmf_20` | 20 | Chaikin Money Flow, bounded ✓ | 20 | EXT |
+| `close_vs_rvwap_20/50` | 20, 50 | `close/rolling VWAP − 1` | 50 | **CORE** (20) |
+| `close_vs_avwap_swinglow` | anchored | `close/AVWAP − 1` from last confirmed swing low | ~60 | **CORE** |
+| `close_vs_avwap_swinghigh` | anchored | same, from last swing high | ~60 | EXT |
+| `close_vs_avwap_ytd` | anchored | from 1 Jan | ≤252 | EXT |
+
+> ⚠️ **No plain daily VWAP.** It's an intraday metric and degenerates to the bar's typical
+> price on daily data — §8.1 #8 has the algebra. Rolling and anchored variants replace it.
+
+#### 6 · PRICE STRUCTURE — Dow Theory & Elliott, from ZigZag pivots (§8.4)
+
+All of these depend on the pivot detector, and **all must respect `confirmed_at`** — this
+is the highest-leakage-risk group in the whole list.
+
+| Feature | Stored as | Tier |
+|---|---|---|
+| `dow_trend` | −1 / 0 / +1 from swing-high and swing-low sequences | **CORE** |
+| `dow_trend_age` | bars since it last changed | **CORE** |
+| `dow_trend_major` | same, from a wider ZigZag (8×ATR vs 3×ATR) | EXT |
+| `dow_mtf_agree` | `dow_trend == dow_trend_major` | EXT |
+| `swing_hh/hl/lh/ll` | 4 booleans on the latest completed leg | EXT |
+| `dow_volume_confirm` | −1 / +1 | EXT |
+| `dow_sector_confirm` | ticker trend == sector ETF trend | EXT |
+| `dist_to_swing_high_atr` | distance to last confirmed swing high ÷ ATR | **CORE** |
+| `dist_to_swing_low_atr` | same, swing low | EXT |
+| `leg_retrace_ratio` | current leg's retracement of the previous, as a fraction | EXT |
+| `fib_zone` | ordinal band: <.236 / .236–.382 / .382–.5 / .5–.618 / .618–.786 / >.786 | EXT |
+| `leg_extension_ratio` | current leg ÷ previous leg | EXT |
+| `legs_since_major` | alternating legs since the last major pivot | EXT |
+| `impulse_vs_corrective` | −1 / +1 | EXT |
+| `leg_slope_atr` | leg price change per bar ÷ ATR | EXT |
+
+#### 7 · BAR SHAPE, GAPS & CALENDAR
+
+| Feature | Stored as | Tier |
+|---|---|---|
+| `clv` | `(close−low)/(high−low)` — where in the day's range it closed | **CORE** |
+| `range_atr` | `(high−low)/ATR` | EXT |
+| `gap_atr` | `(open − prev close)/ATR` | **CORE** |
+| `consec_updown` | signed run length of up/down closes | EXT |
+| `days_since_large_gap` | bars since a gap exceeded 3×ATR | EXT |
+| `quarterly_cycle_pos` | position in the ~63-bar cycle since the last large gap | EXT |
+| `large_gap_due` | 0/1 — the OHLCV-only earnings proxy (§8.2.1) | **CORE** |
+| `day_of_week` | 0–4 categorical | EXT |
+| `sector` | categorical (~11 values) — CatBoost handles natively | EXT |
+
+> **`day_of_week` and `sector` are the only categoricals**, and both are EXTENDED on
+> purpose. Calendar features in particular are easy to overfit on 9 years of data — there
+> are only ~470 Mondays in the sample.
+
+#### Totals
+
+| Family | CORE | EXTENDED |
+|---|---|---|
+| 1 · Trend | 8 | 17 |
+| 2 · Relative & market | 6 | 8 |
+| 3 · Momentum | 7 | 12 |
+| 4 · Volatility | 7 | 11 |
+| 5 · Volume | 6 | 10 |
+| 6 · Structure | 4 | 11 |
+| 7 · Bar shape & calendar | 3 | 8 |
+| **Total** | **41** | **77** |
+
+Dedup (§8.3) will cut some of EXTENDED automatically — RSI, Stochastic, CCI, Williams %R
+and MFI are heavily mutually correlated, and the pipeline drops one of any pair above
+|ρ| > 0.95. Expect the usable extended set to land nearer 60.
+
+> #### If you only implement five features
+>
+> Asked to bet on which carry real signal at this horizon, in order:
+>
+> 1. **`rs_rank`** — relative strength vs the universe. In published equity work this is
+>    repeatedly the strongest single daily-horizon feature, and it's the one thing your
+>    original indicator list had no way to express.
+> 2. **`adx_14`** — separates "trending" from "chop", which is the single most useful
+>    regime split for a tree to make first.
+> 3. **`ema_stack`** — cheap, robust summary of multi-timeframe trend agreement.
+> 4. **`atr_pct_rank`** — volatility regime; gates sizing and tells the model when the
+>    barriers are unusually wide.
+> 5. **`spy_above_ema200`** — long and short setups behave completely differently either
+>    side of this line.
+>
+> Notice that **only one of those five is on your original list** (the EMA one). That's
+> the main substantive thing §8.2 adds: the original list is entirely *absolute and
+> single-ticker*, with no notion of "compared to what?" or "under what conditions?".
 
 ### The contract
 
@@ -1080,10 +1291,9 @@ tuning, whether a profile is even worth modeling:
 
 ### 10.1 Model choice — XGBoost or Random Forest?
 
-You asked directly, so here's the direct answer: **start with
-`HistGradientBoostingClassifier`, and always report Random Forest alongside it as a
-control.** Reach for XGBoost only at the refinement stage, and for one specific reason
-(monotonic constraints — below).
+You asked about XGBoost vs Random Forest, then suggested CatBoost. **CatBoost is the
+right call**, and for a better reason than "it's usually good" — see below. Random Forest
+stays as a **required control**, not an alternative.
 
 But the more useful answer is the caveat first.
 
@@ -1098,7 +1308,7 @@ But the more useful answer is the caveat first.
 > | Getting the cost model wrong (§11) | ~8 points of break-even hit rate |
 > | Features containing no real signal | the entire result |
 > | Universe too small to measure anything (§16 #1) | you can't tell if it worked |
-> | **RF vs XGBoost** | **1–2 points** |
+> | **CatBoost vs RF vs XGBoost** | **1–2 points** |
 >
 > Spend your effort in that order. Model choice is the last ~5% of this problem, and it's
 > the part most people spend 80% of their time on.
@@ -1109,24 +1319,66 @@ But the more useful answer is the caveat first.
 |---|---|---|
 | 1 | `DecisionTreeClassifier(max_depth=3..4)` | **Readable baseline.** Print the whole rule set (`reports/tree.txt`) and read it. It tells you whether the model found something sensible (`ADX>25 and EMA stack aligned and RSI<70 → long`) or something absurd. **Keep this permanently**, not just as a first step — it's your sanity check on everything above it. |
 | 2 | `RandomForestClassifier` | **The control.** Few knobs, hard to misuse, robust to noise. Its job is diagnostic: **if RF beats your boosted model out-of-sample, the boosted model is overfit.** Always report it. |
-| 3 | **`HistGradientBoostingClassifier`** | **The workhorse — start here.** |
-| 4 | `xgboost` | Refinement, for monotonic constraints. |
+| 3 | **`CatBoostClassifier`** | **The primary model.** Reasons below. |
+| 4 | `HistGradientBoostingClassifier` | Second opinion, zero extra dependency. Worth running once to confirm CatBoost isn't doing something odd. |
+| 5 | `xgboost` | Refinement, for monotonic constraints. |
 
-### Why HistGradientBoosting over XGBoost to start
+### Why CatBoost
 
-Both are gradient-boosted trees and will perform within a point or two of each other. HGB
-wins on practicalities:
+You suggested it, and it holds up on merits — **this problem is close to CatBoost's best
+use case**, which is not something I'd say about most datasets.
 
-- ✅ **Native NaN handling.** This genuinely matters: every indicator has a warm-up period,
-  so a 200-EMA feature is NaN for the first 200 bars of *every* ticker. HGB routes NaNs
-  down a learned branch. With RF you must impute first, and imputation on time-series
-  features is its own source of subtle bugs.
-- ✅ **Already in sklearn** — no extra dependency, and it composes with
-  `CalibratedClassifierCV` and the custom CV splitter without adapters.
-- ✅ **Built-in early stopping**, which is your main defence against overfitting.
-- ✅ **Native categorical support** for sector.
-- ✅ **Fewer hyperparameters** than XGBoost — which, as the next box argues, is a *feature*
-  on a dataset this size.
+- ✅ **Ordered boosting** (`boosting_type="Ordered"`) is the real reason. Standard
+  gradient boosting computes each tree's gradients using a model fitted on the *same*
+  rows, which biases the estimates — CatBoost's authors call this *prediction shift*, and
+  it's a subtle form of overfitting that gets worse as the dataset gets smaller and
+  noisier. Ordered boosting estimates gradients from models trained on data *excluding*
+  the row being evaluated. **On ~11,000 effective samples of very low signal-to-noise
+  data, that is exactly the right correction.** It's the one genuinely differentiating
+  feature for us.
+- ✅ **Oblivious (symmetric) trees** by default — every node at a given depth splits on
+  the same feature. That's a strong structural regularizer, which is what you want when
+  the noise dominates. It also makes inference very fast, irrelevant here but harmless.
+- ✅ **Strong defaults and a built-in overfitting detector** (`od_type="Iter"`). This
+  matters more than it sounds: per the box above, *every hyperparameter you tune is
+  another chance to overfit the validation folds*, so a library that needs less tuning is
+  a genuine safety feature, not just a convenience.
+- ✅ **Native NaN handling.** Necessary, not optional — every indicator has a warm-up
+  period, so a 200-day feature is NaN for the first 200 bars of *every* ticker.
+- ✅ Native categorical support for `sector`.
+
+**What CatBoost is famous for that does *not* help us:** its headline feature is
+target-statistic encoding of high-cardinality categoricals. Our features are almost
+entirely numeric — `sector` is the only categorical, and it has ~11 values. So ignore
+that part of the marketing; the reasons to use it here are ordered boosting and the
+regularization defaults.
+
+**The cost:** CatBoost has no `cp315` wheel, which is why the project is on Python 3.14
+(§3). Nothing else in the design cared, so this was cheap.
+
+> #### Suggested starting configuration
+>
+> ```python
+> CatBoostClassifier(
+>     loss_function="Logloss",
+>     boosting_type="Ordered",   # ← the reason we're here. Don't switch to "Plain".
+>     depth=4,                   # SHALLOW. not 8, not 10.
+>     learning_rate=0.03,        # slow
+>     iterations=3000,           # high, but...
+>     od_type="Iter",            # ...stopped by the overfitting detector
+>     od_wait=100,
+>     l2_leaf_reg=10.0,          # strong
+>     rsm=0.7,                   # feature subsampling, decorrelates trees
+>     random_seed=42,
+>     auto_class_weights="Balanced",
+>     verbose=False,
+> )
+> ```
+>
+> ⚠️ **`boosting_type="Ordered"` is slower** — noticeably so on larger datasets. At our
+> size (~11k effective samples) that's fine and worth it. If training becomes painful,
+> reduce `iterations` or `depth` before you reach for `"Plain"`, because `"Plain"` throws
+> away the main reason for choosing this library.
 
 ### Why Random Forest is not the primary choice (but must be reported)
 
@@ -1135,58 +1387,45 @@ fitting what the previous trees got wrong, which makes it more statistically eff
 extracting a weak signal — and a weak signal is precisely what we have.
 
 The counter-argument is real though: **boosting overfits noisy data more readily, and
-financial data is the textbook case.** That's exactly why RF is a required control rather
-than an afterthought. The comparison is informative in both directions:
+financial data is the textbook case.** Ordered boosting mitigates it but does not remove
+it. That's exactly why RF is a required control rather than an afterthought. The
+comparison is informative in both directions:
 
 | Outcome | Reading |
 |---|---|
-| HGB > RF on the holdout | boosting is extracting real signal. Good. |
-| **RF ≥ HGB on the holdout** | **HGB is fitting noise.** Increase regularization, or ship RF. |
+| CatBoost > RF on the holdout | boosting is extracting real signal. Good. |
+| **RF ≥ CatBoost on the holdout** | **CatBoost is fitting noise.** Raise `l2_leaf_reg`, drop `depth` to 3, or ship RF. |
 | Both ≈ the depth-4 tree | there are only a few real effects here. Ship the tree — it's readable and you'll trust it. |
-| All three ≈ base rate | the features don't contain signal. No model fixes that. |
+| All ≈ base rate | the features don't contain signal. No model fixes that. |
 
 That last row is a real possible outcome, and finding it out in week 6 rather than month 6
 is worth the 20 minutes it costs to run all three.
 
 > #### Regularization matters more than which library you pick
 >
-> On ~6,000 effective samples (below) with very low signal-to-noise, the settings matter
-> more than the algorithm. Shallow and slow:
+> On ~11,000 effective samples (below) with very low signal-to-noise, the settings matter
+> more than which library you pick. Shallow, slow, strongly regularized — concrete values
+> for CatBoost are given below.
 >
-> ```python
-> HistGradientBoostingClassifier(
->     max_depth=3,                  # SHALLOW. not 6, not None
->     learning_rate=0.03,           # slow
->     max_iter=2000,                # high, but...
->     early_stopping=True,          # ...stopped by validation loss
->     n_iter_no_change=50,
->     min_samples_leaf=100,         # ~2% of effective samples
->     l2_regularization=1.0,
->     max_features=0.7,             # decorrelate the trees
-> )
-> ```
->
-> The instinct to set `max_depth=6` and `n_estimators=1000` is how you get a beautiful
-> training curve and a worthless model. **Every hyperparameter you tune is another chance
-> to overfit the validation folds**, which is a second reason to prefer HGB's smaller
-> parameter surface, and a reason to keep the search small and coarse.
+> The instinct to set `depth=8` and `iterations=5000` is how you get a beautiful training
+> curve and a worthless model. **Every hyperparameter you tune is another chance to
+> overfit the validation folds**, so keep the search small and coarse — a handful of
+> values for `depth` and `l2_leaf_reg`, and let the overfitting detector handle the rest.
 
 ### What `xgboost` adds, and when to reach for it
 
 One thing worth the dependency, at the refinement stage: **monotonic constraints.** You
-can tell XGBoost that a feature's effect must be non-decreasing — e.g. "all else equal,
-higher ADX must not *decrease* `P(trend continues)`". This encodes domain knowledge
-directly into the hypothesis space, which **reduces overfitting by making the model unable
-to learn implausible shapes.** On a small, noisy dataset that's a genuine edge, and
-sklearn's HGB supports it too (`monotonic_cst`) though less flexibly. Also worth it for
-GPU training or fine control of `scale_pos_weight`.
+can declare that a feature's effect must be non-decreasing — e.g. "all else equal, higher
+ADX must not *decrease* `P(trend continues)`". This encodes domain knowledge directly into
+the hypothesis space, which **reduces overfitting by making implausible shapes
+unlearnable.** On a small, noisy dataset that's a genuine edge. CatBoost supports it too
+(`monotone_constraints`), so try it there first before adding XGBoost.
 
 ### What not to use
 
 | Model | Why not |
 |---|---|
-| **CatBoost** | ⚠️ **No `cp315` wheel** (wheels stop at `cp314`), so it cannot be installed on this Python. Would otherwise be a reasonable third option. |
-| **LightGBM** | Fine, installs cleanly, but it's a third boosting library with no advantage over HGB here. Leaf-wise growth also overfits small data more readily unless carefully capped. |
+| **LightGBM** | Installs cleanly, but it's a fourth boosting library with no advantage over CatBoost here. Leaf-wise growth also overfits small data more readily unless carefully capped. |
 | **Neural networks / LSTMs** | See the sample-size box below. On tabular data at this scale, boosted trees beat deep nets consistently in published benchmarks. The previous project carried a `torch` dependency; drop it. |
 | **Stacking / ensembling the above** | Tempting and almost always a way to overfit the validation folds on a dataset this size. Revisit only if a single model shows a solid holdout edge first. |
 
@@ -1198,17 +1437,15 @@ GPU training or fine control of `scale_pos_weight`.
 > |---|---|
 > | 9 years × ~252 sessions | **~2,268 bars per ticker** |
 > | ÷ horizon 10 (labels overlap — §9) | **~227 *effective independent* samples per ticker** |
-> | × 9 tickers | ~2,000 effective samples |
-> | × 30 tickers | ~6,800 effective samples |
-> | × 60 tickers | ~13,600 effective samples |
+> | **× 50 tickers (chosen)** | **~11,350 effective samples** |
 >
-> With 9 tickers the row count *looks* like 20,000. The information content is ~2,000.
+> The row count will *look* like ~113,000. The information content is ~11,350.
 > **That smaller number is what should govern model complexity** — it's why §10.1 insists
-> on `max_depth=3` and `min_samples_leaf≈100`.
+> on `depth=4` and strong `l2_leaf_reg` rather than the defaults.
 >
 > **The key relationship: `effective samples ≈ tickers × years × 25`.** Years and tickers
-> are interchangeable for statistical power, so the two knobs trade off directly — and
-> tickers are the cheaper one to turn.
+> are interchangeable for statistical power. At 50 × 9 you have enough to justify a
+> regularized boosted model and to get a holdout verdict that means something.
 >
 > What 9 years puts in the window:
 >
@@ -1237,9 +1474,9 @@ GPU training or fine control of `scale_pos_weight`.
 > 2. ⚠️ **But it interacts badly with 10× leverage, and that needs handling** — see the
 >    box below.
 >
-> The recommendation remains **"more tickers"** (§16 #1): 9 years is a solid base, but
-> tickers are the knob that also attacks survivorship bias (§10.5 #7), which adding years
-> does not.
+> One caveat on the 50: they must be **spread across sectors**. Fifty names that all move
+> together deliver far less than fifty tickers' worth of independent information, so the
+> effective count above is an upper bound that assumes reasonable diversification.
 
 > #### ⚠️ Train on the same distribution you'll trade: filter training samples by the inference gates
 >
@@ -1267,8 +1504,7 @@ GPU training or fine control of `scale_pos_weight`.
 > the market-regime features (§8.2) still let the model learn "conditions like these are
 > dangerous." Only the *tradeable samples* are filtered.
 
-**On sample size and model capacity.** Effective sample size is ~2,000–13,600 depending on universe size
-(above). On tabular data at that scale, gradient-boosted trees consistently beat deep nets
+**On sample size and model capacity.** Effective sample size is ~11,350 (above). On tabular data at that scale, gradient-boosted trees consistently beat deep nets
 in published benchmarks. The previous project carried a `torch` dependency; drop it. If you
 later want sequence models, that's an argument for *more tickers first*, not a deeper
 architecture.
@@ -1276,7 +1512,7 @@ architecture.
 **One global model across all tickers**, not one per ticker (per-ticker gets ~3,800 rows
 and overfits). **Deliberately exclude ticker identity as a feature** — it invites the model
 to memorize "NVDA went up 2015–2025", which is survivorship-flavored and won't repeat.
-Sector as a categorical is fine; HGB supports native categoricals.
+Sector as a categorical is fine — CatBoost handles it natively.
 
 ### 10.2 Class imbalance
 
@@ -1320,16 +1556,10 @@ fold 3:  |=========== train =======| purge | embargo |== test ==|
 > **Why 12 months.** With 9 years of history (§10.1) a 12-month holdout is ~11% of the
 > data — a comfortable fraction, leaving 8 years for walk-forward CV.
 >
-> ⚠️ **The holdout is the tightest constraint on your conclusion.** 12 months is ~25
-> effective samples per ticker, so with 9 tickers the holdout carries ~225 — and once the
-> §13 threshold filters most bars out, the surviving *trade* count can fall below the
-> ~100-trade minimum from §10.4. **That would make the final go/no-go verdict itself
-> statistically weak**, however good the training looked. With 30+ tickers it's ~750 and
-> the verdict means something.
->
-> This is §10.1's conclusion arrived at from a different direction, and it's why §16 #1 is
-> the one open question that matters: a wider universe isn't a nice-to-have, it's what
-> makes the final evaluation interpretable at all.
+> **The holdout governs how much your final verdict is worth.** 12 months is ~25 effective
+> samples per ticker, so at 50 tickers it carries ~1,250 — comfortably past the ~100-trade
+> minimum from §10.4 even after the §13 threshold filters most bars out. The go/no-go will
+> mean something, which was not true at 9 tickers (~225).
 
 ### 10.4 Metrics — accuracy is the wrong objective
 
@@ -1381,7 +1611,7 @@ Every item here is a bug I expect this project to hit at least once. Each gets a
 ## 11. Backtest
 
 A small event-driven replay harness in `backtest/engine.py`. Recall from §3 that
-`vectorbt` can't be installed on 3.15 — but we'd write this anyway, because §9's labeler
+`vectorbt` is deliberately unused — we'd write this anyway, because §9's labeler
 already defines the exit logic, and a third-party framework would be a *second,
 independently-drifting* implementation of it. Here, one is the authority and the other
 replays it.
@@ -1614,9 +1844,8 @@ Worth calibrating before you see a number, so you can tell success from self-dec
   short setups have a worse base rate. CFDs remove the mechanical obstacles (§11.1) but
   not that drift. If `M_short` shows no out-of-sample edge, **ship long-only.** That's a
   finding, not a defeat.
-- **Expect wide confidence intervals, and check them.** With 9 years the effective
-  independent sample count is roughly `tickers × 227` (§10.1) — ~2,000 at 9 tickers,
-  ~6,800 at 30. Distinguishing a 40% hit rate from a 45% one needs on the order of a
+- **Expect wide confidence intervals, and check them.** 50 tickers × 9 years gives
+  ~11,350 effective independent samples (§10.1). Distinguishing a 40% hit rate from a 45% one needs on the order of a
   thousand independent trades, so **report confidence intervals on the hit rate, not just
   the point estimate.** If the interval straddles the ~42% break-even, the honest readout
   is "inconclusive", not "profitable". **This is the strongest argument for a wider
@@ -1722,14 +1951,14 @@ Each phase ends somewhere useful, so you can stop or re-scope without a half-bui
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| **0 · Scaffold** | venv 3.15, `CLAUDE.md`, Makefile, test runner | `make venv && make test` green; the venv guard fires outside the venv |
+| **0 · Scaffold** | venv 3.14, `CLAUDE.md`, Makefile, test runner | `make venv && make test` green; the venv guard fires outside the venv |
 | **1 · Fetch** | `yf.download` wrapper, `universe validate`, OHLCV sanity checks, Parquet snapshot | 9 years × your tickers lands clean. ⚠️ **Smoke-test yfinance against pandas 3.1 here** (§3) — it is the one unverified dependency |
 | **2 · Indicators** | registry + Tier-1 + your requested list, Parquet output, CSV export | `test_indicators.py` green; `test_invariance.py` green (§5) |
 | **3 · Chart** | Plotly multi-panel HTML per ticker (§7) | **you open `NVDA.html` and the indicators look right.** This is the gate on phases 1–2 — do not proceed past a chart that looks wrong |
 | **4 · Structure features** | ZigZag + Dow/Elliott with `confirmed_at` | `test_leakage.py` pivot tests green, **and the pivots look right on the chart** — hindsight pivots are obvious visually and nearly invisible in a test |
 | **5 · Labels** | triple barrier, `t1`, weights, `labels sweep` | base rate / timeout fraction / ambiguity rate sane; **TP/SL brackets look sane on the chart** (`--with-labels`) |
 | **6 · Baseline model** | depth-4 tree + purged walk-forward CV | **the printed rule set is readable and not absurd** |
-| **7 · Model comparison** | HGB + RandomForest control + calibration + permutation importance + threshold tuning | all three compared on the same folds (§10.1); you know which row of that table you are in |
+| **7 · Model comparison** | CatBoost + RandomForest control + calibration + permutation importance + threshold tuning | all three compared on the same folds (§10.1); you know which row of that table you are in |
 | **8 · Backtest** | engine, costs, sensitivity grid, shuffled control | survives 2× slippage; beats the shuffled control |
 | **9 · Decide** | `tdm decide`, gates, reports | one command, end to end |
 | **10 · Self-scoring** | `tdm score-decisions` | reproduces phase-8 numbers on the overlapping window |
@@ -1762,28 +1991,28 @@ ticker — already a useful analysis tool on its own, independent of any model.
 | 8 | Weekly features | **Dropped.** Removes a leakage class (§8.2) |
 | 9 | Storage | **No database.** Re-download each run; snapshot only the feature matrix for reproducibility — §5 |
 | 10 | Visualization | **Plotly HTML chart per ticker, generated before training** — §7, build phase 3 |
-| 11 | Model | **HistGradientBoosting primary, RandomForest as a required control**, depth-4 tree as the readable baseline — §10.1 |
+| 11 | Model | **CatBoost primary** (ordered boosting suits small noisy data), **RandomForest as a required control**, depth-4 tree as the readable baseline — §10.1 |
+| 12 | Python | **3.14**, not 3.15 — CatBoost has no cp315 wheel — §3 |
+| 13 | Universe size | **50 tickers**, user-supplied — ~11,350 effective samples, ~1,250 in the holdout — §10.1 |
 
 ---
 
 ## 16. Still open
 
-1. **How many tickers?** ⚠️ **Still the most consequential open item**, and the only one
-   left that changes whether the results are interpretable. 9 years gives
-   `tickers × 227` effective samples (§10.1):
+1. ~~**How many tickers?**~~ **Resolved: 50.** That puts you in good shape —
+   ~11,350 effective samples for training and ~1,250 in the 12-month holdout, which is
+   comfortably past the ~100-trade minimum from §10.4, so the final go/no-go verdict will
+   actually mean something. Two asks on *which* 50:
 
-   | Tickers | Effective samples | 12-month holdout | Verdict quality |
-   |---|---|---|---|
-   | 9 | ~2,000 | ~225 | ⚠️ too thin for a confident go/no-go |
-   | 30 | ~6,800 | ~750 | workable |
-   | 60 | ~13,600 | ~1,500 | good |
+   - **Spread them across sectors.** 50 correlated mega-cap tech names deliver far less
+     than 50 tickers' worth of independent information, because they mostly move together.
+     Aim for coverage: tech, financials, healthcare, energy, industrials, consumer,
+     utilities, materials.
+   - **Include some losers.** Deliberately add names that did badly over the window
+     (INTC is a good start). This is the only practical lever against the survivorship
+     bias in §10.5 #7 — a list of today's winners was selected *because* they went up, and
+     a model trained only on those learns that buying always works.
 
-   **Recommendation: 30 minimum, 50–60 preferred, spread across sectors** rather than
-   concentrated in tech. Nine mega-cap tech names are also highly correlated with each
-   other, so 9 tickers delivers appreciably less than 9× the information of one. More
-   tickers is the only knob that buys statistical power *and* attacks survivorship bias
-   (§10.5 #7) at once — and since you're supplying the list, it costs you nothing but
-   typing.
 2. **Risk per trade.** Default is 1% of equity, max 5 concurrent, margin ceiling 50%
    (§11). At 10× leverage, 1% risk uses only ~5% of equity as margin per position, so
    you could comfortably run 10–15 concurrent positions — which **lowers** variance

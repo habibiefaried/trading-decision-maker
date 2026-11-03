@@ -10,17 +10,17 @@ take-profit and stop-loss levels.
 
 ## Setup
 
-Requires **Python 3.15** and runs entirely inside `./venv`.
+Requires **Python 3.14** and runs entirely inside `./venv`.
 
 ```bash
-brew install python@3.15
+brew install python@3.14
 make venv
 ```
 
 Or manually:
 
 ```bash
-/opt/homebrew/bin/python3.15 -m venv venv
+/opt/homebrew/bin/python3.14 -m venv venv
 ./venv/bin/python -m pip install -U pip
 ./venv/bin/pip install -r requirements.txt
 ```
@@ -87,7 +87,7 @@ obvious on a chart and nearly invisible in a metric.
 ```bash
 make train                                     # purged walk-forward CV
 ./venv/bin/python -m tdm.cli train --model decision_tree    # readable baseline
-./venv/bin/python -m tdm.cli train --model hgb              # primary
+./venv/bin/python -m tdm.cli train --model catboost         # primary
 ./venv/bin/python -m tdm.cli train --model rf               # required control
 ./venv/bin/python -m tdm.cli train --compare                # all three, same folds
 ./venv/bin/python -m tdm.cli explain --run-id <id>          # rules + importances

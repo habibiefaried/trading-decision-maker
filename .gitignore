@@ -240,10 +240,7 @@ reports/*
 !reports/.gitkeep
 
 # ...and belt-and-braces, in case these land outside the dirs above
-*.db
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
 *.parquet
 *.feather
+runs.jsonl
+decisions.jsonl

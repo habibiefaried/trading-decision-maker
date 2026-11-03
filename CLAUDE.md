@@ -2,7 +2,8 @@
 
 ## 1. ALWAYS use the project venv. Never the system Python.
 
-This project targets **Python 3.15** and runs entirely inside `./venv`.
+This project targets **Python 3.14** and runs entirely inside `./venv`.
+(Not 3.15 — CatBoost has no cp315 wheel. See DESIGN.md §3.)
 
 ```bash
 ./venv/bin/python   # the ONLY interpreter you may use
@@ -10,8 +11,8 @@ This project targets **Python 3.15** and runs entirely inside `./venv`.
 ```
 
 **Do not** run `python`, `python3`, `pip`, or `pip3` bare — on this machine those
-resolve to pyenv's 3.13.1 shim or Homebrew's 3.14, both of which are wrong, and
-installing into them silently pollutes the user's global environment.
+resolve to pyenv's 3.13.1 shim, which is the wrong interpreter, and installing into it
+silently pollutes the user's global environment.
 
 **Do not** use `source venv/bin/activate` in a `Bash` tool call. Shell state does not
 persist between tool calls in Claude Code, so the activation is gone by the next
@@ -21,7 +22,7 @@ interpreter by its explicit path, or go through `make`.
 Prefer `make` targets, which already point at `./venv/bin/python`:
 
 ```bash
-make venv        # create venv with Python 3.15 + install requirements
+make venv        # create venv with Python 3.14 + install requirements
 make fetch       # incremental OHLCV download into data/market.db
 make features    # compute indicators
 make label       # build triple-barrier labels
@@ -36,8 +37,8 @@ make lint
 If `./venv` does not exist, create it — don't fall back to system Python:
 
 ```bash
-brew install python@3.15                      # provides 3.15.2
-/opt/homebrew/bin/python3.15 -m venv venv
+brew install python@3.14                      # already installed
+/opt/homebrew/bin/python3.14 -m venv venv
 ./venv/bin/python -m pip install -U pip
 ./venv/bin/pip install -r requirements.txt
 ```
@@ -101,11 +102,11 @@ Each of these has burned this class of project before. DESIGN.md explains why.
     across tickers, and features become invariant to splits — which is what makes
     re-downloading safe. `tests/test_invariance.py` enforces it by injecting a synthetic
     split and asserting past feature values are unchanged. (§8.5, §5)
-14. **Models: HistGradientBoosting is primary, RandomForest is a required control.** If
-    RF matches or beats HGB on the holdout, HGB is overfit — report both, always. Keep
-    the depth-4 tree permanently as the readable baseline. Shallow and heavily
-    regularized: `max_depth=3`, `learning_rate=0.03`, `min_samples_leaf≈100`, early
-    stopping on. CatBoost has no cp315 wheel; do not add it. (§10.1)
+14. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
+    beats CatBoost on the holdout, CatBoost is overfit — report both, always. Keep the
+    depth-4 tree permanently as the readable baseline. Shallow and heavily regularized:
+    `depth=4`, `learning_rate=0.03`, `l2_leaf_reg≈10`, `od_type="Iter"` early stopping.
+    Leave `boosting_type="Ordered"` on — it is the reason we chose CatBoost. (§10.1)
 13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
     `min_liquidity` and the gap filter run at sample-construction time too — otherwise
     you train on regimes you will never trade in (e.g. March 2020 at 10x leverage).
@@ -136,13 +137,13 @@ projects (including `~/code/stock-market-entry-signal-tpsl-specific`) will likel
 - `inplace=True` now returns `self` instead of `None`.
 - String columns infer to the new `str` dtype, not `object`.
 
-Packages that **cannot** be installed on Python 3.15 — don't try:
+Package constraints on Python 3.14:
 
-| Package | Why |
+| Package | Status |
 |---|---|
-| `pandas-ta` | pins `numba==0.61.2`, no cp315 wheel. Use **TA-Lib**. |
-| `vectorbt` | declares `requires-python <3.15`. Use the in-repo `backtest/engine.py`. |
-| `catboost` | wheels stop at cp314. Use `HistGradientBoostingClassifier`. |
+| `pandas-ta` | ❌ **cannot install** — pins `numba==0.61.2`, no cp314 wheel. Use **TA-Lib**. |
+| `vectorbt` | ⚠️ installable, but **don't** — §11: the labeler already defines exit logic, and a second implementation would drift. Use the in-repo `backtest/engine.py`. |
+| `catboost` | ✅ available on 3.14 (this is why we're on 3.14). |
 
 ## 5. Don't commit data
 
