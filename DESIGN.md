@@ -28,7 +28,7 @@ whichever happens first. Give up after 10 days either way."*
 
 | Stage | What it is, in engineering terms | Cost to run | Idempotent? |
 |---|---|---|---|
-| **1. Ingest** | Pull rows from a flaky, rate-limited third-party HTTP API into local SQLite | **Expensive** (network, rate limits) | Yes — and must *skip* work already done |
+| **1. Ingest** | Pull rows from a third-party HTTP API that is only intermittently available, into local SQLite | **Expensive** (network, and the service is often down) | Yes — and must *skip* work already done |
 | **2. Features** | `map` a few hundred pure functions over a time series to build a wide numeric matrix | Cheap (seconds) | Yes — pure, fully recomputable |
 | **3. Train** | Generate labels by simulation, then fit a classifier | Minutes | Yes, given a fixed seed |
 | **4. Decide** | Load model, run inference on today's row, write output | Milliseconds | Yes |
@@ -337,7 +337,7 @@ Dependencies point one way only. Two consequences worth enforcing in review:
   functions over DataFrames. That's what makes them unit-testable without a network or a
   database, which in turn is what makes §10.5's leakage tests possible.
 - **`ingest/` is the only module that makes HTTP calls.** All network flakiness,
-  retries, and rate-limit handling is contained there.
+  retries, and availability handling is contained there.
 
 ### What went wrong in the previous attempt
 
@@ -346,8 +346,8 @@ The user's earlier project (`~/code/stock-market-entry-signal-tpsl-specific`) ha
 `AAPL_tpsl_data_20260610.csv`, one per ticker per day. Two concrete failure modes that
 this layout exists to fix:
 
-1. **No cache.** Every run re-downloaded everything, so it self-inflicted API rate limits
-   and iteration was slow. → §7.
+1. **No cache.** Every run re-downloaded everything, so iteration was slow and any run
+   could fail outright whenever yfinance happened to be down. → §7.
 2. **No provenance.** Given `models/xyz.pkl` there was no way to recover which features,
    which parameters, or which date range produced it. **So you couldn't meaningfully
    compare two models** — the central activity of the project. → the `*_run` tables in §5.
@@ -360,7 +360,7 @@ this layout exists to fix:
 
 | Data | Store | Reason |
 |---|---|---|
-| Raw daily bars | **SQLite** | Expensive to re-acquire (network, rate limits). Needs transactions and durability. |
+| Raw daily bars | **SQLite** | Expensive to re-acquire — the upstream is only intermittently available (§7.1). Needs transactions and durability. |
 | Corporate actions | **SQLite** | Small, critical, same reason |
 | Provenance / run metadata | **SQLite** | Relational, queried ad hoc |
 | Issued decisions + outcomes | **SQLite** | Append-only audit log |
@@ -463,11 +463,20 @@ CREATE TABLE fetch_coverage (
 
 -- Sessions the calendar says exist but the provider has no data for.
 -- Without this table, every run re-requests the same permanent holes forever.
+--
+-- `confirmations` exists because yfinance is INTERMITTENTLY AVAILABLE (§7.1):
+-- a flaky empty response is indistinguishable from a genuine hole, and
+-- recording one as permanent would silently truncate your history forever.
+-- A gap is only trusted as permanent once corroborated.
 CREATE TABLE known_gap (
-    symbol        TEXT NOT NULL,
-    ts            TEXT NOT NULL,
-    reason        TEXT NOT NULL,            -- 'no_data' | 'halted' | 'pre_ipo'
-    checked_at    TEXT NOT NULL,
+    symbol        TEXT    NOT NULL,
+    ts            TEXT    NOT NULL,
+    reason        TEXT    NOT NULL,         -- 'no_data' | 'halted' | 'pre_ipo'
+    confirmations INTEGER NOT NULL DEFAULT 1,
+    corroborated  INTEGER NOT NULL DEFAULT 0,  -- 1 = a fetch returned OTHER dates
+                                               --     in the same range but not this one
+    first_seen    TEXT    NOT NULL,
+    checked_at    TEXT    NOT NULL,
     PRIMARY KEY (symbol, ts)
 ) STRICT;
 
@@ -475,8 +484,10 @@ CREATE TABLE fetch_log (
     id            INTEGER PRIMARY KEY,
     symbol        TEXT, interval TEXT, source TEXT,
     req_start     TEXT, req_end TEXT,
-    status        TEXT NOT NULL,            -- 'ok' | 'empty' | 'rate_limited' | 'error'
+    status        TEXT NOT NULL,            -- 'ok' | 'partial' | 'empty'
+                                            -- | 'unavailable' | 'error'
     rows_written  INTEGER,
+    attempts      INTEGER NOT NULL DEFAULT 1,
     error         TEXT,
     duration_ms   INTEGER,
     at            TEXT NOT NULL
@@ -689,9 +700,63 @@ series is the right thing to *compute on*. That's why `corporate_action` and
 
 ## 7. Incremental ingest: never download the same bar twice
 
-The user's explicit requirement. This is a cache-coherency problem with three wrinkles:
-the upstream is rate-limited, it has permanent holes that look identical to cache misses,
-and it revises recent rows.
+The user's explicit requirement. A cache-coherency problem with three wrinkles: the
+upstream is **intermittently available**, it has permanent holes that look identical to
+cache misses, and it revises recent rows.
+
+### 7.1 The upstream is flaky, not quota-limited
+
+Per the user: yfinance isn't rate-limited so much as **available only some of the time.**
+That's a different failure model from a quota, and it changes three things.
+
+> #### ⚠️ The bug this creates, which the first draft of this section had
+>
+> An earlier version recorded any **empty response as a permanent `known_gap`**. Under a
+> quota model that's fine — a quota error is a distinct, recognizable failure. Under
+> *intermittent availability* it is a serious bug:
+>
+> ```
+> run 1:  fetch NVDA 2019-01..2019-06   -> service flaky, returns EMPTY
+>         -> 120 sessions written to known_gap as "no_data"
+> run 2+: planner subtracts known_gap   -> those 120 days are never requested again
+>         -> six months of NVDA history permanently missing, and
+>            `tdm db status` reports full coverage
+> ```
+>
+> **Nothing errors.** You get a silently truncated series, your indicators have a hole in
+> them, and the coverage table cheerfully says everything is fine. This is the same class
+> of silent-wrongness as the adjusted-price bug in §6, and it's worse because the data
+> isn't recoverable without noticing first.
+>
+> **The fix: an empty response is never, on its own, evidence of a gap.** A gap is only
+> trusted when *corroborated*:
+>
+> | Evidence | Treatment |
+> |---|---|
+> | Fetch returned data for **other** dates in the same range, but not this one | `corroborated = 1` → trust it. The service clearly worked; the date genuinely has no bar |
+> | Fetch returned **entirely** empty | **Do not write a gap.** Log `status='empty'` and retry on a later run |
+> | A date has come back empty on **N separate runs** (default 3) on different days | `confirmations >= N` → accept as permanent |
+> | Before the ticker's known first bar | `reason='pre_ipo'` → trust immediately, it's structural |
+>
+> Uncorroborated gaps stay **retryable**, so a flaky afternoon costs you one wasted request
+> later rather than a permanent hole.
+
+The other two consequences are more pleasant:
+
+- **Partial progress must be durable, and already is.** Fetching 50 tickers when the
+  service drops out at ticker 23 should commit the first 22 and resume cleanly.
+  `fetch_coverage` is per-symbol, so this works for free — a failed run is just a shorter
+  next run. Add `tdm fetch --retry-failed` to re-attempt everything in `fetch_log` with
+  `status IN ('error','unavailable','empty')`.
+- **Concurrency is fine.** With no quota to respect, there's no reason to serialize. Fetch
+  symbols in parallel with a modest cap (8–16) — and note yfinance 1.4.0 made `download()`
+  reentrant by removing shared module globals, so this is safer than it used to be. Keep
+  the cap configurable so it can be turned down if parallelism itself seems to trigger the
+  flakiness.
+
+Retries use exponential backoff with jitter, but the *reason* is different from a quota
+backoff: you're waiting for a service to come back, not serving a penalty. So retry
+budgets can be generous (say 5 attempts over a few minutes) rather than conservative.
 
 ### The provider interface
 
@@ -704,13 +769,24 @@ class Provider(Protocol):
     name: str
 
     def fetch_bars(self, symbol: str, start: date, end: date,
-                   interval: str = "1d") -> pd.DataFrame:
-        """Raw, UNADJUSTED OHLCV. Raises RateLimited (retryable)
-        or ProviderError (fatal). Returns empty frame for no data."""
+                   interval: str = "1d") -> BarsResult:
+        """Raw, UNADJUSTED OHLCV.
+
+        Returns BarsResult(frame, served) where `served` distinguishes
+        "the provider answered" from "the provider was unreachable" —
+        the caller CANNOT infer this from an empty frame (§7.1).
+
+        Raises Unavailable (retryable) or ProviderError (fatal).
+        """
 
     def fetch_actions(self, symbol: str) -> pd.DataFrame: ...
     def fetch_metadata(self, symbol: str) -> dict: ...
 ```
+
+> **Why `BarsResult` and not just a DataFrame.** An empty DataFrame is ambiguous — it
+> means either "no bars exist here" or "the service didn't answer", and §7.1 shows that
+> conflating those corrupts the cache. Making the provider report which one it was pushes
+> the distinction into the type, so the planner can't accidentally guess wrong.
 
 ### The sync planner
 
@@ -753,20 +829,41 @@ def plan(symbol: str, requested_start: date) -> list[DateRange]:
     return ranges
 ```
 
-Then execute: `fetch` each range with exponential backoff + jitter on `YfRateLimitError`
-(yfinance raises this explicitly since 0.2.52), `UPSERT` the rows, bump `revision` where
-OHLCV actually changed, record any still-absent target session as a `known_gap`, recompute
-`fetch_coverage`, and append to `fetch_log`.
+Then execute each range:
+
+```python
+res = retry(provider.fetch_bars, range, attempts=5, backoff="exp+jitter")
+
+if not res.served:                      # provider was unreachable (§7.1)
+    log(status="unavailable"); continue # NO gap written, range stays retryable
+
+store.upsert_bars(res.frame)            # bump `revision` where OHLCV changed
+store.upsert_actions(...)
+
+absent = set(range.sessions) - set(res.frame.index)
+if res.frame.empty:
+    log(status="empty")                 # uncorroborated -> bump confirmations only
+    store.touch_gap_candidates(absent)  # permanent only at confirmations >= 3
+else:
+    log(status="ok" if not absent else "partial")
+    store.mark_gap(absent, corroborated=True)   # the service answered: trust it
+
+store.recompute_coverage(symbol)
+```
+
+The asymmetry in that last branch is the whole point of §7.1: **absent dates are only
+trusted as real gaps when the same response returned data for other dates.**
 
 ### Why each wrinkle needs its own mechanism
 
 | Wrinkle | Mechanism | What breaks without it |
 |---|---|---|
 | Market isn't open every day | `exchange_calendars` NYSE schedule | You treat ~10 holidays/year as missing data and re-request them every run |
-| Permanent holes (pre-IPO, halts) look like cache misses | `known_gap` table | The missing-set never converges; you burn the rate limit on holes that can never fill |
+| Permanent holes (pre-IPO, halts) look like cache misses | `known_gap` table | The missing-set never converges; every run re-requests holes that can never fill |
 | Running mid-session | `last_final` + settle lag | You cache a partial bar whose "close" is just the last trade so far, as if final |
 | Provider revises recent rows | `RESTATE_LOOKBACK = 5` + `UPSERT` + `revision` | Your recent tail silently diverges from the source |
-| Rate limiting | backoff + `fetch_log` status | A 429 gets misread as "no data" and written as a permanent `known_gap` |
+| **Service only up some of the time** | `BarsResult.served` + `corroborated` / `confirmations` (§7.1) | **A flaky empty response becomes a permanent hole; history is silently truncated and coverage still reports OK** |
+| Service drops out mid-run | per-symbol `fetch_coverage` + `--retry-failed` | A 30-ticker run loses all 30 because ticker 23 failed |
 
 ### Acceptance test
 

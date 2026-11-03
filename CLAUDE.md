@@ -71,6 +71,13 @@ Each of these has burned this class of project before. DESIGN.md explains why.
 2. **Never fetch a date range already covered.** Go through `ingest/sync.py`, which
    consults `fetch_coverage` and `known_gap`. Fetching twice is the bug this repo
    exists to avoid. (§7)
+   **Never write a `known_gap` from an empty response alone.** yfinance is only
+   intermittently available, so an empty frame means either "no bars exist" or "the
+   service was down" — and recording the second as permanent silently truncates history
+   while coverage still reports OK. A gap needs corroboration: the same response
+   returned other dates in that range, or 3+ empties on separate runs, or it predates
+   the ticker's first bar. Providers return `BarsResult(frame, served)` so this is never
+   a guess. (§7.1)
 3. **No lookahead, ever.** A feature on date *d* may only use bars up to and including
    *d*. In particular: ZigZag pivots must respect `confirmed_at`; z-scores and percentile
    ranks use trailing windows only (never `fit()` on the full series). (§8.5, §10.5)
