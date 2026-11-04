@@ -27,6 +27,19 @@ Or manually:
 
 Always invoke the interpreter explicitly as `./venv/bin/python`, or use `make`.
 
+### A note on `tdm`
+
+`tdm` is **t**rading **d**ecision **m**aker — the package name and the CLI. After
+`make venv` it exists as `./venv/bin/tdm`. These two are equivalent:
+
+```bash
+./venv/bin/tdm fetch
+./venv/bin/python -m tdm.cli fetch
+```
+
+The commands below use the second form so it's unambiguous which Python is running. If
+you'd rather type less, `alias tdm="./venv/bin/tdm"` from the repo root.
+
 ## Daily use
 
 ```bash

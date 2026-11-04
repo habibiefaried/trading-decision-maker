@@ -236,6 +236,21 @@ pandas 3 is a breaking release. The changes that affect this project:
 
 ## 4. Repository layout
 
+> **`tdm` = **t**rading **d**ecision **m**aker.** It's the Python package name
+> (`src/tdm/`) and the CLI command name. A `console_scripts` entry point in
+> `pyproject.toml` maps it to `tdm.cli:app`, so after `make venv` the binary exists at
+> `./venv/bin/tdm`.
+>
+> Throughout this document `tdm fetch` is shorthand for either of these, which are the
+> same thing:
+>
+> ```bash
+> ./venv/bin/tdm fetch                      # via the console script
+> ./venv/bin/python -m tdm.cli fetch         # via the module, identical
+> ```
+>
+> Nothing is installed globally — `tdm` only exists inside `./venv` (§3).
+
 ```
 trading-decision-maker/
 ├── .python-version              # 3.14
@@ -243,6 +258,7 @@ trading-decision-maker/
 ├── DESIGN.md                    # this file — the "why"
 ├── README.md                    # the "how to run" only
 ├── Makefile
+├── pyproject.toml               # packaging + the `tdm` console script
 ├── requirements.txt
 │
 ├── config/
