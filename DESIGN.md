@@ -337,6 +337,59 @@ Dependencies point one way only. Two consequences worth enforcing in review:
   can call any feature on a synthetic 50-row frame.
 - **`report/` reads the feature matrix; it never computes an indicator.** §7 explains why.
 
+### The whole run, end to end
+
+Everything above assembles into roughly this. It's the shape `cli.py` should orchestrate,
+and the clearest single answer to "what does this program actually do":
+
+```python
+def run(cfg: Config) -> None:
+    # ── 1. FETCH (§5) — the only network access in the program
+    tickers   = read_universe(cfg.universe.file)          # your stocks
+    bars      = fetch(tickers, years=cfg.universe.years)  # {ticker: DataFrame}
+    reference = fetch(["^GSPC", "^VIX"], years=cfg.universe.years)
+    validate_ohlcv(bars)                                  # high>=low, no dupes, sorted
+
+    # ── 2. FEATURES (§6) — pure, scale-free, per-ticker
+    feats = {tk: build_features(df, reference, cfg.features) for tk, df in bars.items()}
+    feats = add_cross_sectional(feats)       # rs_rank needs the whole universe at once
+    X     = concat(feats)                    # one wide frame, MultiIndex (symbol, date)
+
+    # ── 3. CHARTS (§7) — read X, never recompute. Look at these.
+    for tk in tickers:
+        write_chart(f"reports/charts/{tk}.html", X.loc[tk])
+
+    # ── 4. DATASET (§8) — add the 3-class targets by simulating each trade
+    for side in (Side.LONG, Side.SHORT):
+        X[f"y_{side}"], X[f"y_{side}_t1"], ... = label_all(bars, side, cfg.labels)
+    X = add_forward_returns(X, bars)         # fwd_* diagnostics (§8.1)
+    X = mark_gates(X, cfg.gates)             # meta_gate_pass (§9.1)
+
+    # ── 5. TRAIN (§9) — two 3-class models, purged walk-forward CV
+    features = registry.feature_names(cfg.model.features)   # ALLOWLIST (§8.1)
+    train_df, holdout = split_holdout(X, months=cfg.model.holdout_months)
+    samples = train_df[train_df.meta_gate_pass]             # same gates as §11
+
+    models, metrics = {}, {}
+    for side in (Side.LONG, Side.SHORT):
+        y, t1, w = samples[f"y_{side}"], samples[f"y_{side}_t1"], samples[f"y_{side}_weight"]
+        cv = PurgedWalkForwardSplit(t1, embargo=cfg.model.embargo_bars)
+        models[side], metrics[side] = fit_and_score(
+            samples[features], y, w, cv=cv, kind=cfg.model.primary)
+
+    # ── 6. DECIDE (§11) — score the latest bar, rank by expected value
+    today = X.xs(X.index.get_level_values("date").max(), level="date")
+    calls = [decide(tk, row, models, cfg) for tk, row in today.iterrows()]
+    calls = sorted((c for c in calls if c.action != "HOLD"),
+                   key=lambda c: -c.ev_r)[:free_slots(cfg)]
+
+    print_table(calls)
+    append_jsonl("decisions.jsonl", calls)   # the logbook — §5
+```
+
+Notice what isn't there: no cache lookup, no migration, no model load. The only persistent
+state the program touches is the `decisions.jsonl` append at the very end.
+
 ---
 
 ## 5. Fetching data
@@ -1319,7 +1372,7 @@ barrier hit are both "wins" under a binary label, and they are not remotely the 
 Keeping them separate turns the model output into something you can compute an expected
 value from:
 
-> ### Why this matters: expected value instead of a threshold
+> ### What three probabilities buy you: a price for every trade
 >
 > With three classes you can price every candidate trade directly. Working in units of
 > **R** — multiples of the dollar amount you're risking, $100 in the §10.2 example:
@@ -1345,11 +1398,13 @@ value from:
 > `P(TP)` rose more. A binary model cannot express this — it reports one number and you
 > have to pick a cut-off for it.
 >
-> **This replaces the tuned probability threshold with an economic one.** "Only take trades
-> with expected value above +$10 per $100 risked" is a statement you can reason about and
-> explain. "Only take trades where p > 0.58" is not. §11 uses this as the decision rule,
-> and §10.3's cost arithmetic feeds straight into it rather than sitting in a separate
-> sanity check.
+> **The decision bar is therefore an amount of money, not a probability.** "Only take
+> trades with expected value above +$10 per $100 risked" is a statement you can reason
+> about, explain, and defend. §11 uses this as the decision rule, and §10.3's cost
+> arithmetic feeds straight into it rather than sitting in a separate sanity check.
+>
+> It also **ranks** candidates. When more signals clear the bar than you have free slots,
+> the best-priced ones get taken.
 
 > ⚠️ **Verify that TIMEOUT is actually a meaningful class before committing to this.** The
 > three-class split pays off in proportion to how often TIMEOUT occurs, and that's an
@@ -1359,7 +1414,7 @@ value from:
 > |---|---|
 > | **> 30%** | 3-class is clearly worth it — a large chunk of outcomes were being mislabeled as wins or losses |
 > | 10–30% | 3-class is worth it; EV pricing is the main benefit |
-> | **< 10%** | the class is too rare to learn. Collapse to binary, or raise `horizon` / widen `k_tp` so more trades time out |
+> | **< 10%** | too rare to learn as its own class. Merge TIMEOUT into SL (a trade that went nowhere and paid costs is a small loss), or raise `horizon` / widen `k_tp` so more trades time out |
 >
 > With TP 1.5 ATR / SL 1 ATR at H=10, barriers tend to resolve faster than a naive random
 > walk suggests, because they're tested against intraday highs and lows rather than closes.
@@ -1477,7 +1532,7 @@ tdm labels sweep     # per profile, report:
 **Run this before training.** In five minutes it tells you whether a profile is worth
 modeling at all:
 
-- **TIMEOUT below 10%** means the third class is too rare to learn — collapse to binary or
+- **TIMEOUT below 10%** means the third class is too rare to learn — merge it into SL or
   lengthen the horizon (§8.2).
 - **Mean EV at the base rates below zero** means the profile is unprofitable *even with a
   perfect model*. No amount of tuning saves it; change the profile.
@@ -1872,28 +1927,36 @@ Break-even hit rate `p` solves `p × (150 − 25) = (1 − p) × (100 + 25)`:
 **Costs move the bar by 10 percentage points**, and `P(TP)` has to clear 50% for the trade
 to be worth taking at all.
 
-> #### ⚠️ TP 1.5 makes the cost problem harder than TP 2.0 would
+> #### ⚠️ Choosing the TP/SL profile — the fixed-cost trap
 >
-> Spread and slippage are **fixed per trade** — you pay the same $15 whether you're
-> chasing 1.5 ATR or 3 ATR. So a nearer target amortizes them worse:
+> Spread and slippage are **fixed per trade**: you pay the same ~$15 whether you're
+> chasing 1.5 ATR or 3 ATR. So a nearer profit target amortizes them worse, and the
+> break-even bar moves a long way with the profile:
 >
-> | Profile | Break-even, no costs | **Break-even, with costs** | Random-walk base rate | Margin |
-> |---|---|---|---|---|
-> | TP 2.0 / SL 1.0 | 33.3% | 41.7% | ~33% | −8.3 pts |
-> | **TP 1.5 / SL 1.0** | 40.0% | **50.0%** | ~40% | **−10.0 pts** |
+Holding the dollar risk fixed at $100, a wider stop means **fewer units**, so a smaller
+position and smaller fixed costs — which compounds the effect:
+
+> | Profile | Units | Notional | Costs | Break-even, no costs | **Break-even, with costs** | Random-walk base rate | Gap to close |
+> |---|---|---|---|---|---|---|---|
+> | **TP 1.5 / SL 1.0** (config default) | 50 | $5,000 | $25 | 40.0% | **50.0%** | ~40% | −10.0 pts |
+> | TP 2.0 / SL 1.0 | 50 | $5,000 | $25 | 33.3% | 41.7% | ~33% | −8.3 pts |
+> | TP 2.5 / SL 1.25 | 40 | $4,000 | $20 | 33.3% | 40.0% | ~33% | −6.7 pts |
+> | TP 3.0 / SL 1.5 | 33 | $3,333 | $17 | 33.3% | **38.9%** | ~33% | **−5.6 pts** |
 >
-> The base rate does rise with a nearer target (a 1.5-ATR move happens more often than a
-> 2-ATR one), but **it rises by less than break-even does** — so on this arithmetic the
-> margin the model has to make up gets slightly wider, not narrower.
+> Reading the table: a nearer target raises the base rate (a 1.5-ATR move happens more
+> often than a 2-ATR one), but **it raises break-even by more** — so the gap the model has
+> to close roughly doubles going from the widest profile to the narrowest.
 >
-> **The compensating benefits are real, though,** and they matter at 15 tickers:
-> more trades reach TP, so the TP class gets more training examples; trades resolve faster,
-> which means less financing and **less label overlap, hence more effective samples**
-> (§9.1). Those gains are not captured by the napkin arithmetic above.
+> Two effects pull the other way and aren't in those numbers, and they matter at 15
+> tickers: a nearer target means **more trades reach TP**, so the TP class gets more
+> training examples; and trades **resolve faster**, which means less label overlap, hence
+> more effective samples (§9.1). A wider profile buys a lower bar; a narrower one buys more
+> data to clear it with.
 >
-> So this is a genuine trade-off rather than a mistake, and it's exactly what
-> `tdm labels sweep` exists to settle. **Run `--profiles 1.5/1.0, 2.0/1.0, 3.0/1.5` before
-> committing** and compare measured EV, not theory.
+> Which effect wins is an empirical question, so **don't settle this from the table.** Run
+> `tdm labels sweep --profiles 1.5/1.0,2.0/1.0,3.0/1.5` and compare measured EV. The
+> config default is the nearest profile because it's the easiest to trade psychologically;
+> the sweep exists to check that it's also the most profitable.
 
 Two further consequences:
 
@@ -2183,7 +2246,7 @@ min_ev_r    = 0.10                    # minimum expected value to trade, in R.
 |---|---|---|
 | `max_concurrent` | 10 | Lower to 5 if "−10% in a day" (§10.2) is more than you want. Note it can't bind above your ticker count |
 | `costs.*` | estimates | As soon as you can read your real spread and overnight fee off the platform — they move break-even by ~8 points (§10.3) |
-| `k_tp` / `k_sl` | 1.5 / 1.0 | **Soon.** Break-even with costs is 50% at this profile vs 41.7% at TP 2.0 (§10.3). Run `labels sweep` across 1.5/1.0, 2.0/1.0 and 3.0/1.5 before settling |
+| `k_tp` / `k_sl` | 1.5 / 1.0 | **First thing to test.** Break-even with costs is 50% here and 38.9% at TP 3.0 / SL 1.5 (§10.3). Run `labels sweep --profiles 1.5/1.0,2.0/1.0,2.5/1.25,3.0/1.5` |
 | `min_ev_r` | 0.10 | Raise it to trade less and better; every trade pays the fixed cost again (§10.3) |
 | `features` | `minimal` | Move to `core` once `minimal` shows signal, or if you grow the universe past ~20 tickers (§6.3) |
 | `universe` | ~15 tickers | Adding tickers is the cheapest way to buy statistical power and the only way to get a holdout verdict you can size up on (§5) |
