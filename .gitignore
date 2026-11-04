@@ -227,7 +227,7 @@ __marimo__/
 # vendor-licensed price data.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# SQLite price cache (DESIGN.md §4), Parquet features (§6), models, reports.
+# Reports (charts, decision logs). Nothing else is persisted — see DESIGN.md §5.
 # Ignore the *contents* and re-include .gitkeep, so a fresh clone still has the
 # directory skeleton to write into. Note: `data/` alone would NOT work here —
 # git doesn't descend into an excluded directory, so the negations below would

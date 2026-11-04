@@ -15,20 +15,23 @@ or do nothing — and if you trade, the exact prices at which to exit.
 ```
 $ make daily
 
-NVDA   LONG   conf 0.71
+NVDA   LONG   EV +$19 per $100 risked     P(TP) 0.51  P(SL) 0.32  P(TIMEOUT) 0.17
   entry  ~$183.40    (indicative; actual fill is tomorrow's open)
-  TP      $196.10     +$200 if hit
-  SL      $177.05     −$100 if hit
+  TP      $189.12     +3.1%   →  +$149 if hit
+  SL      $179.59     −2.1%   →  −$99 if hit
   size     26 units  = $4,768 notional, $477 margin
   hold    ≤ 10 trading days, then exit at market
 
-AMD    HOLD   conf 0.48   — no edge: ADX 14 (choppy), gap-risk window
+AMD    HOLD   EV −$12      P(TP) 0.31  P(SL) 0.38  P(TIMEOUT) 0.31
+                           — below the +$10 minimum; ADX 14 (choppy)
 
 account: 3 of 10 slots used · $1,431 of $5,000 margin · $300 currently at risk
 ```
 
-Read the NVDA line as: *bet NVDA goes up. Take the profit at $196.10, or cut the loss at
-$177.05, whichever comes first. Give up after 10 days either way.*
+Read the NVDA line as: *bet NVDA goes up. Take the profit at $189.12, or cut the loss at
+$179.59, whichever comes first. Give up after 10 days either way.* The model estimates a
+51% chance of reaching the profit target first, which prices out at +$19 of expected value
+per $100 risked (§8.2).
 
 ### Settings
 
@@ -39,10 +42,12 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 | Data source | `yfinance`, daily bars, 9 years |
 | Execution venue | IQ Option stock CFDs, 10× leverage |
 | Style | Swing trading — hold across days |
-| Take-profit | 2.0 × ATR from entry |
+| Take-profit | 1.5 × ATR from entry |
 | Stop-loss | 1.0 × ATR from entry |
 | Max holding period | 10 trading days |
 | Entry | next day's open (two alternatives in §8.2) |
+| Target | 3 classes: **TP** / **SL** / **TIMEOUT** (§8.2) |
+| Decision | expected value in dollars, not a probability threshold (§11) |
 | Directions | Long and short |
 | Account | $10,000, risk 1% per trade, max 10 concurrent positions |
 | Primary model | CatBoost (gradient-boosted trees) |
@@ -56,12 +61,13 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 | **2. Features** | `map` ~100 pure functions over each series → one wide numeric matrix | seconds |
 | **3. Chart** | Render price + every indicator to interactive HTML so you can read it | seconds |
 | **4. Dataset** | Add target columns by simulating each trade | seconds |
-| **5. Train** | Fit a classifier with time-aware cross-validation | minutes |
-| **6. Decide** | Run inference on today's row, write the output table | milliseconds |
+| **5. Train** | Fit a 3-class classifier with time-aware cross-validation | minutes |
+| **6. Decide** | Score today's row, rank by expected value, print the table | milliseconds |
 
-**There is no database.** The pipeline is a pure function from `(ticker list, date range)`
-to `(charts, model, decisions)`. Every stage re-derives its input. §5 explains why that
-works.
+**Nothing is stored.** The whole pipeline runs in memory, in one process: download →
+compute → chart → train → decide. There is no database, no cache, no feature store and no
+model artifact. Each run re-derives everything from the ticker list. §5 covers what that
+costs and the one thing worth writing to disk anyway.
 
 ### Three things that make this harder than ordinary ETL
 
@@ -123,9 +129,9 @@ works.
 | Term | Meaning |
 |---|---|
 | **Return** | Percentage change: `(exit − entry) / entry`. |
-| **R:R** | Ratio of TP distance to SL distance. TP 2 ATR / SL 1 ATR = 2.0 — you win twice what you lose, per event. |
+| **R:R** | Ratio of TP distance to SL distance. TP 1.5 ATR / SL 1 ATR = 1.5 — you win 1.5× what you lose, per event. |
 | **Hit rate** | Fraction of trades that reach TP instead of SL. **Analogous to precision, not accuracy.** |
-| **Expectancy** | `p_win × avg_win − p_loss × avg_loss`. Expected value per trade. **This is the real objective function.** At R:R 2.0 you break even at a 33% hit rate, so "67% of predictions wrong" is still profitable — which is why accuracy is a near-useless metric here (§9.3). |
+| **Expectancy** | `p_win × avg_win − p_loss × avg_loss`. Expected value per trade. **This is the real objective function.** At R:R 1.5 you break even at a 40% hit rate before costs, so "60% of predictions wrong" can still be profitable — which is why accuracy is a near-useless metric here (§9.3). |
 | **Base rate** | The unconditional fraction of positive labels. Your baseline to beat. |
 | **Drawdown** | Peak-to-trough decline in account value. Max drawdown is the worst stretch you'd have had to sit through. |
 | **Backtest** | A replay harness: run the strategy over history and see what would have happened. Trivially easy to get wrong in ways that flatter you (§10). |
@@ -202,7 +208,6 @@ All verified to have `cp314` wheels or be pure-Python:
 | catboost | 1.2.10 | primary model (§9.1) |
 | TA-Lib (`ta-lib`) | 0.8.3 | indicator engine. Wheels are self-contained — no `brew install ta-lib` |
 | plotly | 7.1.0 | interactive HTML charts (§7) |
-| pyarrow | 26.0.1 | Parquet |
 | yfinance | 1.7.0 | data source |
 | exchange-calendars | 4.13.2 | market session calendar |
 | typer / rich / pydantic-settings / pytest | — | CLI, output, config, tests |
@@ -287,10 +292,10 @@ trading-decision-maker/
 │   │   ├── volume.py            #    OBV, MFI, VWAP variants
 │   │   ├── structure.py         #    ZigZag pivots -> Dow/Elliott features (§6.4)
 │   │   ├── market.py            #    relative strength vs ^GSPC, market regime
-│   │   └── pipeline.py          #    orchestrate, normalize, write Parquet
+│   │   └── pipeline.py          #    orchestrate, normalize, return the matrix
 │   │
 │   ├── dataset/
-│   │   ├── barriers.py          #    the trade simulator that produces y (§8.2)
+│   │   ├── barriers.py          #    the 3-class trade simulator (§8.2)
 │   │   └── build.py             #    join features + targets into one table (§8.1)
 │   │
 │   ├── model/
@@ -305,8 +310,7 @@ trading-decision-maker/
 │   │   └── diagnostics.py       #    correlation heatmap, feature distributions
 │   │
 │   ├── backtest/engine.py       #    §10
-│   ├── provenance.py            #    append to runs.jsonl
-│   └── decide.py                #    §11 — production inference
+│   └── decide.py                #    §11 — EV ranking + the daily output
 │
 ├── tests/
 │   ├── test_indicators.py       # vs TA-Lib / hand-computed fixtures
@@ -314,14 +318,10 @@ trading-decision-maker/
 │   ├── test_invariance.py       # inject a split, assert past features unchanged (§5)
 │   └── test_barriers.py
 │
-├── data/                        # GITIGNORED
-│   ├── features/<run_id>.parquet
-│   ├── datasets/<run_id>.parquet
-│   └── exports/*.csv
-├── models/<run_id>/             # GITIGNORED
 ├── reports/                     # GITIGNORED — charts/, equity.html, decisions
-├── runs.jsonl                   # GITIGNORED — provenance log
-└── decisions.jsonl              # GITIGNORED — never delete (§11)
+└── decisions.jsonl              # GITIGNORED — the logbook; never delete (§5, §11)
+
+   (no data/ or models/ directory — nothing is cached or persisted, §5)
 ```
 
 ### Layering rule
@@ -341,15 +341,23 @@ Dependencies point one way only. Two consequences worth enforcing in review:
 
 ## 5. Fetching data
 
-### No database
+### Nothing is stored
 
-Each run downloads fresh. `yfinance` is fast and reliable enough that re-downloading is
-cheaper than the bookkeeping needed to avoid it — and it means no schema, no migrations,
-no cache invalidation, no staleness logic.
+The pipeline is stateless. One process does everything:
+
+```
+fetch ──> features ──> dataset ──> train ──> decide
+            │                                  │
+            └──> charts (HTML)        decisions.jsonl (append)
+```
+
+No database, no Parquet cache, no saved model. Every run re-downloads and recomputes. At
+15 tickers × 9 years that's ~34,000 rows — fetch is ~20–60 s and the feature pass is
+seconds, so there is nothing worth caching.
 
 ```python
 df = yf.download(
-    tickers,                 # all 50 in one call
+    tickers,                 # all of them in one call
     start=start, end=end,
     interval="1d",
     auto_adjust=True,        # ← see below
@@ -374,15 +382,14 @@ the split and after it would be on different scales, in the same table, with no 
 raised.
 
 Since nothing is stored, that can't happen. Every run gets one internally consistent
-series.
+series — which is the main reason statelessness is a simplification rather than a
+compromise.
 
 ### Why re-downloading doesn't change your features
 
-The remaining worry: if a stock splits between two runs, the second run's prices are all
-rescaled. Doesn't that change the training data?
-
-**No.** A split rescales every pre-split price by the same constant `k`, and every feature
-(§6.2) is a *ratio*, so `k` cancels:
+If a stock splits between two runs, the second run's prices are all rescaled. That does
+**not** change any feature value: a split rescales every pre-split price by the same
+constant `k`, and every feature (§6.2) is a *ratio*, so `k` cancels.
 
 | Feature | Under a rescale by `k` | Result |
 |---|---|---|
@@ -394,33 +401,54 @@ rescaled. Doesn't that change the training data?
 | `volume/median_volume` | both scale by `1/k` | **unchanged** |
 
 The scale-free rule in §6.2 exists so a decision tree's thresholds transfer across
-tickers. It also makes the feature matrix immune to re-downloading. **Scale-free and
-corporate-action-invariant are the same property.**
+tickers. It also makes the feature values independent of when you ran the pipeline.
+**Scale-free and corporate-action-invariant are the same property.**
 
-`tests/test_invariance.py` enforces this: inject a synthetic 10:1 split into a series,
-recompute all features, assert every value before that date is bit-identical. Any feature
-that fails is not scale-free, which means it was also broken for §6.2's reason. One
-assertion, two bug classes.
+`tests/test_invariance.py` enforces it: inject a synthetic 10:1 split, recompute all
+features, assert every value before that date is bit-identical. Any feature that fails is
+not scale-free, which means it was also broken for §6.2's reason. One assertion, two bug
+classes.
 
-### Snapshots, for comparing models
+### The one constraint statelessness imposes
 
-What *does* differ between runs is the tail — new bars arrive daily. Harmless for daily
-use, corrosive for one activity:
+> **Model comparison must happen inside a single process.** Two runs on different days see
+> different data — one extra bar, at minimum — so a model trained Monday and a model
+> trained Friday aren't comparable, and you can't tell a worse model from a changed
+> dataset.
+>
+> So `tdm train --compare` fits the decision tree, RandomForest and CatBoost on **the same
+> in-memory dataset, in one invocation**, and prints them side by side. Never compare
+> numbers from two separate runs.
 
+### Two things that are output, not cache
+
+| Written | Why it isn't storage |
+|---|---|
+| `reports/charts/*.html` | A chart has to be a file to open in a browser. It's the product of §7, not a cache. |
+| `decisions.jsonl` | ⬇ see below |
+
+> #### `decisions.jsonl` — a logbook, not a cache
+>
+> This one is worth keeping even under a no-storage rule, because **it cannot be
+> recomputed.** It records what the model told you on a given day using the data available
+> *that* day. Re-running the pipeline next month produces a different model on different
+> data, so the original decision is gone forever if it wasn't written down.
+>
+> That matters because it's **the only genuinely out-of-sample evidence this system will
+> ever produce** — no purging subtleties, no leakage, no survivorship bias, just a
+> prediction log and what happened next. §9.2 notes the 12-month holdout at 15 tickers is
+> too thin for a confident verdict; this log is what eventually replaces it.
+>
+> One line per decision, roughly 150 bytes. A year of 15 tickers is well under 1 MB.
+>
+> If you'd rather not keep it, the system still runs — you just lose the ability to ever
+> find out whether it worked.
+
+Optional, on demand, never automatic:
+
+```bash
+tdm dataset --dump-csv out.csv     # inspect the table in Excel (§8.1)
 ```
-Monday:  train model A, holdout expectancy 0.31
-Friday:  train model B, holdout expectancy 0.28
-         -> is B worse, or did the dataset change underneath you?
-```
-
-Comparing models is the central activity of this project, so:
-
-> `tdm dataset build` writes `data/datasets/<run_id>.parquet` where
-> `run_id = hash(tickers, date range, feature config, code version)`, and appends a line
-> to `runs.jsonl`. Training reads a snapshot by default; `--refresh` forces a new fetch.
-
-A file and a hash. No schema, no invalidation — per the invariance result above, a snapshot
-is correct forever.
 
 ### The universe is your input
 
@@ -479,8 +507,8 @@ number governs how many features you can use and how much the final verdict is w
 > works at any size, since it's measured against `^GSPC` rather than against peers — so you
 > don't lose relative strength entirely, just the cross-sectional ranking of it.
 
-If you want to add tickers later, do it — more is strictly better for the statistics, and
-the only cost is a slightly longer fetch. There's no schema to migrate (§5).
+Adding tickers later costs nothing but a slightly longer fetch — there's no schema and
+nothing stored (§5).
 
 ### Validate before downloading
 
@@ -928,8 +956,7 @@ self-contained file with zoom, pan and hover tooltips — no server, no build st
 
 ```python
 # RIGHT: chart the exact numbers the model will see
-features = pd.read_parquet(f"data/features/{run_id}.parquet")
-plot(features.loc[ticker])
+plot(features.loc[ticker])        # the in-memory matrix the model will see
 
 # WRONG: a second implementation that can silently disagree
 plot(talib.RSI(bars.close, 14))
@@ -970,7 +997,7 @@ confirms the ATR scaling works.
 
 ### 8.1 The table
 
-One row per `(symbol, date)`, written to Parquet, exportable to CSV.
+One row per `(symbol, date)`, held in memory for the length of the run (§5).
 
 ```
 ┌─ IDENTITY ────────────────────────────── never features ─┐
@@ -988,18 +1015,18 @@ One row per `(symbol, date)`, written to Parquet, exportable to CSV.
   ... 40 CORE columns (§6.3), ~117 with EXTENDED
 
 ┌─ TARGETS (y) ───────────────── one set per direction, from §8.2 ─┐
-  y_long                  int8       1 = TP hit before SL, 0 = not
-  y_short                 int8
+  y_long                  str        "TP" | "SL" | "TIMEOUT"   ← 3-class
+  y_short                 str        "TP" | "SL" | "TIMEOUT"
   y_long_t1               date       ⚠️ when the label RESOLVED — §9.2 needs this
   y_short_t1              date
-  y_long_reason           str        tp | sl | timeout | ambiguous
-  y_short_reason          str
   y_long_ret              float      realized return, NET of costs (§10)
   y_short_ret             float
   y_long_hold_days        int8
   y_short_hold_days       int8
   y_long_weight           float      label-uniqueness weight (§8.2)
   y_short_weight          float
+  y_long_excluded         str|null   "no_fill" | "gated" — reason this row is
+  y_short_excluded        str|null     not a training sample (§8.2, §9.1)
 
 ┌─ FORWARD RETURNS ─────── diagnostics + optional alternative target ─┐
   fwd_ret_1d              float      close[t+1]/close[t] − 1
@@ -1011,13 +1038,13 @@ One row per `(symbol, date)`, written to Parquet, exportable to CSV.
 
 ┌─ META ───────────────────────────────── bookkeeping, never features ─┐
   meta_gate_pass          bool       passed the §11 hard gates (§9.1)
-  meta_run_id             str        provenance (§5)
 ```
 
+The table lives in memory for the length of the run (§5). To look at it:
+
 ```bash
-tdm dataset build --set core
-tdm dataset export --format csv      # -> data/exports/<run_id>.csv
-tdm dataset schema                   # column list, dtypes, tier
+tdm dataset --dump-csv out.csv       # optional, on demand
+tdm dataset --schema                 # column list, dtypes, tier
 ```
 
 ### Why the target is a barrier outcome, not a price
@@ -1134,20 +1161,28 @@ a race between three conditions — close to `asyncio.wait(..., FIRST_COMPLETED)
 ```
      price
        │
-  TP ──┼─────────────────────────────  ← profit barrier    → y = 1
+  TP ──┼─────────────────────────────  ← profit barrier    → y = "TP"
        │        ╱╲
  entry─┼──────╱────╲──╱──────────────
        │    ╱        ╲╱
-  SL ──┼──────────────────────────────  ← loss barrier      → y = 0
+  SL ──┼──────────────────────────────  ← loss barrier      → y = "SL"
        │
        └────────────────────────┤
-        t+1                    t+10     ← timeout barrier   → y = sign(net return)
+        t+1                    t+10     ← time barrier      → y = "TIMEOUT"
 ```
 
+**Three barriers, three classes, one per row per direction.** The time barrier is a real
+outcome in its own right — not a degenerate case to be folded into win or loss.
+
 ```python
+class Outcome(StrEnum):
+    TP      = "TP"       # profit barrier hit first
+    SL      = "SL"       # loss barrier hit first
+    TIMEOUT = "TIMEOUT"  # neither, within `horizon` days — exited at market
+
 def label_one(bars, t: int, side: Side, cfg) -> Label:
     atr   = bars.atr_14.iloc[t]        # known at t's close — no future data
-    entry = bars.open.iloc[t + 1]      # decide at t's close, fill at next open
+    entry = entry_price(bars, t, side, cfg)   # see "Entry price" below
 
     if side is Side.LONG:
         tp, sl = entry + cfg.k_tp * atr, entry - cfg.k_sl * atr
@@ -1159,16 +1194,17 @@ def label_one(bars, t: int, side: Side, cfg) -> Label:
         hit_tp = (hi >= tp) if side is Side.LONG else (lo <= tp)
         hit_sl = (lo <= sl) if side is Side.LONG else (hi >= sl)
 
-        if hit_tp and hit_sl:          # same bar touched BOTH
-            return Label(y=0, t1=bars.index[i], reason="ambiguous")
+        if hit_tp and hit_sl:                       # same bar touched BOTH
+            return Label(Outcome.SL, t1=bars.index[i])   # pessimistic, decision 1
         if hit_tp:
-            return Label(y=1, t1=bars.index[i], reason="tp")
+            return Label(Outcome.TP, t1=bars.index[i])
         if hit_sl:
-            return Label(y=0, t1=bars.index[i], reason="sl")
+            return Label(Outcome.SL, t1=bars.index[i])
 
+    # Neither barrier fired. Exit at market on the last bar of the window.
     exit_px = bars.close.iloc[t + cfg.horizon]
-    net = net_return(entry, exit_px, side, cfg.costs)
-    return Label(y=int(net > 0), t1=..., reason="timeout", net_return=net)
+    return Label(Outcome.TIMEOUT, t1=...,
+                 net_return=net_return(entry, exit_px, side, cfg.costs))
 ```
 
 ### What "horizon" means
@@ -1188,10 +1224,10 @@ Three reasons it exists, in order of importance:
 3. **Financing accrues daily** (§10.1). On a leveraged CFD a stagnant position isn't
    neutral — it bleeds a little every day.
 
-**Why 10?** It should match the TP distance. With TP at 2 × ATR you're asking for roughly
-two average days of movement *in one direction*, and random walks take considerably longer
-than two days to travel two ATRs. Empirically ~5–15 days is where a 2-ATR move either
-happens or the setup has gone stale.
+**Why 10?** It should match the TP distance. With TP at 1.5 × ATR you're asking for about
+a day and a half of average movement *in one direction*, and a random walk takes
+considerably longer than that to travel 1.5 ATRs net. Empirically ~5–15 days is where such
+a move either happens or the setup has gone stale.
 
 It's a config value, not a law. `tdm labels sweep` reports the timeout fraction: **if most
 trades are timing out, `H` is too short** or the TP is too far; if almost none are, `H`
@@ -1231,8 +1267,8 @@ isn't doing any work and you're paying financing for nothing.
 > its TP on price and still lose money on carry.
 >
 > There's also a statistical curiosity worth knowing: with infinite time and barriers at
-> +2 / −1 ATR, a driftless random walk hits the nearer barrier first about two-thirds of
-> the time, giving a base rate near 33% — which is almost exactly break-even before costs
+> +1.5 / −1 ATR, a driftless random walk hits the nearer barrier first about 60% of
+> the time, giving a base rate near 40% — which is exactly break-even before costs
 > (§10.3). So removing the timeout doesn't just break the machinery; it converges the label
 > toward "no edge by construction".
 >
@@ -1263,23 +1299,71 @@ treatment below.
 spread, slippage (a fraction of ATR — execution noise scales with volatility, so fixed
 basis points would be wrong), and daily financing on the notional for both directions
 (§10.1). Because the timeout branch labels on `net_return > 0`, the model learns *post-cost*
-profitability directly. Given that costs move break-even from 33% to ~42% (§10), having
-them inside the label is what keeps the training target honest.
+profitability directly. Given that costs move break-even from 40% to **50%** at this
+profile (§10.3), having them inside the label is what keeps the training target honest.
 
-**4. Two binary models, not one three-class model.** The obvious framing is a 3-class label
-(LONG / SHORT / HOLD). Two problems: with asymmetric barriers (TP 2 ATR, SL 1 ATR) the
-up-bet and down-bet are **not mirror images**, so one label can't encode both; and "HOLD"
-would need an invented dead-zone threshold **baked into the labels, where you can never
-re-tune it.** Instead:
+**4. Two 3-class models — and the third class is what makes the decision rule work.**
 
 ```python
-M_long  : P(long  hits TP before SL | features)      # binary
-M_short : P(short hits TP before SL | features)      # binary
+M_long  : P(TP), P(SL), P(TIMEOUT)  for a long  entry   # 3-class
+M_short : P(TP), P(SL), P(TIMEOUT)  for a short entry   # 3-class
 ```
 
-HOLD *emerges at inference time* as "neither probability clears its threshold" (§11), so
-the thresholds become runtime knobs you tune against results. It also lets each direction
-learn its own feature relationships.
+Two models rather than one, because with asymmetric barriers (TP 1.5 ATR, SL 1 ATR) the
+up-bet and the down-bet are **not mirror images** — one label can't encode both, and each
+direction gets to learn its own feature relationships.
+
+Three classes rather than two, because **folding TIMEOUT into win/loss by the sign of its
+return destroys the information needed to price the trade.** A +0.3% timeout and a +2 ATR
+barrier hit are both "wins" under a binary label, and they are not remotely the same trade.
+Keeping them separate turns the model output into something you can compute an expected
+value from:
+
+> ### Why this matters: expected value instead of a threshold
+>
+> With three classes you can price every candidate trade directly. Working in units of
+> **R** — multiples of the dollar amount you're risking, $100 in the §10.2 example:
+>
+> ```
+> EV_R = (k_tp/k_sl)·P(TP)  −  1·P(SL)  +  r_timeout·P(TIMEOUT)  −  cost_R
+>
+>      = 1.5·P(TP) − P(SL) + r_timeout·P(TIMEOUT) − 0.25
+> ```
+>
+> `cost_R ≈ 0.25` is the $25 of spread, slippage and financing from §10.3 against a $100
+> risk. `r_timeout` is the mean net return of timeout exits, in R — estimated empirically
+> per fold from the training data, and typically close to zero.
+>
+> | P(TP) | P(SL) | P(TIMEOUT) | EV | Decision |
+> |---|---|---|---|---|
+> | 0.30 | 0.35 | 0.35 | **−0.15 R** = −$15 | hold |
+> | 0.45 | 0.30 | 0.25 | **+0.13 R** = +$13 | trade |
+> | 0.52 | 0.33 | 0.15 | **+0.20 R** = +$20 | trade |
+> | 0.25 | 0.50 | 0.25 | **−0.38 R** = −$38 | hold |
+>
+> Note row 3: `P(SL)` is *higher* than row 2 and it's still the better trade, because
+> `P(TP)` rose more. A binary model cannot express this — it reports one number and you
+> have to pick a cut-off for it.
+>
+> **This replaces the tuned probability threshold with an economic one.** "Only take trades
+> with expected value above +$10 per $100 risked" is a statement you can reason about and
+> explain. "Only take trades where p > 0.58" is not. §11 uses this as the decision rule,
+> and §10.3's cost arithmetic feeds straight into it rather than sitting in a separate
+> sanity check.
+
+> ⚠️ **Verify that TIMEOUT is actually a meaningful class before committing to this.** The
+> three-class split pays off in proportion to how often TIMEOUT occurs, and that's an
+> empirical question `tdm labels sweep` answers:
+>
+> | TIMEOUT fraction | Reading |
+> |---|---|
+> | **> 30%** | 3-class is clearly worth it — a large chunk of outcomes were being mislabeled as wins or losses |
+> | 10–30% | 3-class is worth it; EV pricing is the main benefit |
+> | **< 10%** | the class is too rare to learn. Collapse to binary, or raise `horizon` / widen `k_tp` so more trades time out |
+>
+> With TP 1.5 ATR / SL 1 ATR at H=10, barriers tend to resolve faster than a naive random
+> walk suggests, because they're tested against intraday highs and lows rather than closes.
+> So don't assume TIMEOUT will be the largest class — measure it.
 
 **5. Sample weights, because the labels overlap.** Bar `t` and bar `t+1` both look 10 days
 ahead, so **consecutive samples share most of their future** and are not independent.
@@ -1293,6 +1377,11 @@ Standard CV treats them as if they were, which inflates every metric. Two correc
 **Practical consequence:** 15 tickers × ~2,268 bars ≈ 34,000 rows, but the **effective
 independent sample count is ~3,400.** That smaller number is what governs model
 complexity, and it's why §6.3 recommends 18 features rather than 118.
+
+⚠️ **Three classes divide that further.** If the split is roughly TP 25% / SL 35% /
+TIMEOUT 40%, the smallest class has ~850 effective samples. That's workable for a depth-4
+tree on 18 features, and it is another reason not to reach for the full feature list.
+`labels sweep` reports per-class effective counts so you can see this directly.
 
 ### Entry price: what you can and can't use
 
@@ -1376,23 +1465,25 @@ than an uncommitted edit.
 
 ```bash
 tdm labels sweep     # per profile, report:
-                     #   base rate            (fraction of positive labels)
+                     #   class distribution   TP / SL / TIMEOUT  <- check TIMEOUT >10%
+                     #   per-class effective sample count
+                     #   mean EV in R at the empirical class rates (§8.2)
                      #   break-even hit rate  (from the §10 cost model)
-                     #   margin above break-even   <- the number that matters
-                     #   timeout fraction, ambiguity rate
-                     #   effective sample count
+                     #   ambiguity rate, mean holding days
                      #   median fwd_mfe / fwd_mae in ATR (§8.1)
+                     #   fill rate (if entry_mode = limit_pullback)
 ```
 
 **Run this before training.** In five minutes it tells you whether a profile is worth
 modeling at all:
 
-- A **15% base rate** means the setup is rare and you'll learn from very few positives.
-- A base rate **below the break-even hit rate** means the profile is unprofitable *even
-  with a perfect model* — no tuning saves it.
-- Since §10's cost arithmetic puts break-even near 42%, this is where you find out whether
-  a wider profile (TP 3 / SL 1.5) amortizes the fixed costs better. **Don't assume
-  TP 2 / SL 1 is optimal just because it's the starting point.**
+- **TIMEOUT below 10%** means the third class is too rare to learn — collapse to binary or
+  lengthen the horizon (§8.2).
+- **Mean EV at the base rates below zero** means the profile is unprofitable *even with a
+  perfect model*. No amount of tuning saves it; change the profile.
+- Since §10.3's costs put break-even at **50%** for this profile, this is where you find
+  out whether a wider profile amortizes the fixed costs better. **Don't assume TP 1.5 /
+  SL 1 is optimal just because it's the starting point** — see the box in §10.3.
 
 ---
 
@@ -1447,7 +1538,8 @@ are ordered boosting and the regularization defaults.
 
 ```python
 CatBoostClassifier(
-    loss_function="Logloss",
+    loss_function="MultiClass",    # 3 classes: TP / SL / TIMEOUT (§8.2)
+    classes_count=3,
     boosting_type="Ordered",   # ← the reason we're here. Don't switch to "Plain".
     depth=4,                   # SHALLOW. not 8, not 10.
     learning_rate=0.03,        # slow
@@ -1507,10 +1599,17 @@ as a categorical is fine.
 
 ### Class imbalance
 
-With TP 2 ATR / SL 1 ATR the positive rate will be well under 50%. **Don't fight it with
-resampling** — SMOTE on time-series features synthesizes rows that violate the temporal
-structure. Use `auto_class_weights="Balanced"` and tune the decision threshold, which §11
-does anyway.
+The three classes won't be equally sized — expect TP and SL to dominate and TIMEOUT to be
+the smallest (§8.3 measures it). **Don't fight it with resampling**: SMOTE on time-series
+features synthesizes rows that violate the temporal structure. Use
+`auto_class_weights="Balanced"`.
+
+⚠️ **But calibration matters more here than balance.** §11 computes expected value directly
+from `P(TP)`, `P(SL)` and `P(TIMEOUT)`, so those probabilities have to be *numerically
+right*, not merely well-ranked. A model that ranks perfectly but reports 0.70 when the true
+rate is 0.45 will systematically overstate EV and overtrade. Calibrate all three classes
+with `CalibratedClassifierCV` on a purged inner split, and check the reliability curve per
+class — not just overall.
 
 ### Train on the distribution you'll trade
 
@@ -1577,17 +1676,18 @@ Accuracy is near-meaningless on an imbalanced problem with asymmetric payoffs. A
 always says HOLD can score 70% accuracy and be worth nothing. Report per fold **and per
 direction**:
 
-**Classification:** precision at the operating threshold (the one that matters: *of the
-trades you actually take, how many win*), recall/coverage, PR-AUC (better than ROC-AUC
-under imbalance), and **calibration** — a reliability curve, because §11 prints the
-probability as a confidence number and "0.71" needs to actually mean 71%. Calibrate with
-`CalibratedClassifierCV` on a purged inner split.
+**Classification, per class:** a 3×3 confusion matrix (the TP↔TIMEOUT confusions matter
+much less than TP↔SL ones, and a single accuracy number hides that); precision on the TP
+class among trades actually taken; per-class PR-AUC; and **per-class calibration curves**,
+since §11 feeds all three probabilities into an EV calculation and a miscalibrated
+`P(TP)` directly becomes a wrong dollar figure.
 
 **Economic — the real scoreboard:**
 
 | Metric | Why |
 |---|---|
 | **Expectancy per trade**, net of costs | the single number that decides whether to use this |
+| **Predicted vs realized EV** | the model says +$19; did the trade average +$19? A systematic gap means miscalibration, not bad luck |
 | Profit factor | gross wins ÷ gross losses |
 | Hit rate + average R multiple | the two components of expectancy |
 | Max drawdown, Calmar | whether you could actually tolerate it |
@@ -1698,7 +1798,7 @@ Using the NVDA example from §1 — entry $183.40, ATR $3.81, stop 1 ATR away:
 | 4. Position value (notional) | 26 × $183.40 | **$4,768** |
 | 5. Margin tied up at 10× | $4,768 ÷ 10 | **$477** |
 | 6. Loss if the stop hits | 26 × $3.81 | **−$100** ✓ |
-| 7. Gain if the TP hits | 26 × 2 × $3.81 | **+$200** |
+| 7. Gain if the TP hits | 26 × 1.5 × $3.81 | **+$149** |
 
 Step 6 is the check — it returns to $100 by construction. **You decide the loss first, and
 the position size falls out of it.**
@@ -1751,35 +1851,56 @@ the sizing formula.
 
 Costs are not a rounding error here, and it's worth seeing the number before building
 anything. Same example — $10,000 equity, 1% risk, $100 stock, ATR $2, 50 units, $5,000
-notional, TP 2 ATR / SL 1 ATR, 10-day hold:
+notional, TP 1.5 ATR / SL 1 ATR, 10-day hold:
 
 | | |
 |---|---|
-| Gross win (TP hit) | 2 × $2 × 50 = **+$200** |
-| Gross loss (SL hit) | 1 × $2 × 50 = **−$100** |
+| Gross win (TP hit, 1.5 ATR) | 1.5 × $2 × 50 = **+$150** |
+| Gross loss (SL hit, 1.0 ATR) | 1 × $2 × 50 = **−$100** |
 | Spread, round trip | 0.10% × $5,000 = −$5 |
 | Slippage, both sides | 0.1 × ATR × 50 = −$10 |
 | Financing, 10 days | 0.02%/day × 10 × $5,000 = −$10 |
 | **Total costs** | **−$25** |
 
-Break-even hit rate `p` solves `p × (200 − 25) = (1 − p) × (100 + 25)`:
+Break-even hit rate `p` solves `p × (150 − 25) = (1 − p) × (100 + 25)`:
 
 | | Break-even hit rate |
 |---|---|
-| Ignoring costs | **33.3%** |
-| **With costs** | **41.7%** |
+| Ignoring costs | **40.0%** |
+| **With costs** | **50.0%** |
 
-**Costs move the bar by 8.4 percentage points.** Since §12 puts a realistically good hit
-rate at ~45%, costs consume most of the available margin. Three consequences:
+**Costs move the bar by 10 percentage points**, and `P(TP)` has to clear 50% for the trade
+to be worth taking at all.
 
-1. **§12's expectations are calibrated against 41.7%, not 33%.** A 40% hit rate is a
-   *losing* strategy here, not a near-miss.
-2. **Spread and slippage are fixed per trade; financing scales with holding time.** So
-   *wider* barriers amortize the fixed part better — a TP 3 / SL 1.5 profile pays the same
-   spread to chase a 50% bigger move. A real argument for testing wider profiles, which
-   `tdm labels sweep` (§8.3) reports on.
-3. **Fewer, better trades beat more trades.** Every extra trade pays the fixed cost again —
-   an independent argument for a high decision threshold in §11.
+> #### ⚠️ TP 1.5 makes the cost problem harder than TP 2.0 would
+>
+> Spread and slippage are **fixed per trade** — you pay the same $15 whether you're
+> chasing 1.5 ATR or 3 ATR. So a nearer target amortizes them worse:
+>
+> | Profile | Break-even, no costs | **Break-even, with costs** | Random-walk base rate | Margin |
+> |---|---|---|---|---|
+> | TP 2.0 / SL 1.0 | 33.3% | 41.7% | ~33% | −8.3 pts |
+> | **TP 1.5 / SL 1.0** | 40.0% | **50.0%** | ~40% | **−10.0 pts** |
+>
+> The base rate does rise with a nearer target (a 1.5-ATR move happens more often than a
+> 2-ATR one), but **it rises by less than break-even does** — so on this arithmetic the
+> margin the model has to make up gets slightly wider, not narrower.
+>
+> **The compensating benefits are real, though,** and they matter at 15 tickers:
+> more trades reach TP, so the TP class gets more training examples; trades resolve faster,
+> which means less financing and **less label overlap, hence more effective samples**
+> (§9.1). Those gains are not captured by the napkin arithmetic above.
+>
+> So this is a genuine trade-off rather than a mistake, and it's exactly what
+> `tdm labels sweep` exists to settle. **Run `--profiles 1.5/1.0, 2.0/1.0, 3.0/1.5` before
+> committing** and compare measured EV, not theory.
+
+Two further consequences:
+
+1. **Spread and slippage are fixed per trade; financing scales with holding time.** Wider
+   barriers amortize the fixed part better — which is the whole content of the box above.
+2. **Fewer, better trades beat more trades.** Every extra trade pays the fixed cost again —
+   an independent argument for a high EV threshold in §11.
 
 ### 10.4 Gap risk, amplified 10×
 
@@ -1840,16 +1961,18 @@ def decide(symbol: str, as_of: date) -> Decision:
     if x["large_gap_due"]:
         return HOLD("gap-risk window")        # earnings proxy, §6.3
 
-    # ── Model
-    p_long  = m_long.predict_proba(x)[1]
-    p_short = m_short.predict_proba(x)[1]
+    # ── Model: 3-class probabilities per direction (§8.2)
+    pl = m_long.predict_proba(x)     # {TP, SL, TIMEOUT}
+    ps = m_short.predict_proba(x)
 
-    if p_long >= cfg.theta_long and p_long > p_short:
-        side = Side.LONG
-    elif p_short >= cfg.theta_short and p_short > p_long:
-        side = Side.SHORT
-    else:
-        return HOLD(f"no edge: p_long={p_long:.2f} p_short={p_short:.2f}")
+    # Expected value in R — multiples of the dollar amount at risk
+    ev_long  = ev_r(pl, cfg)         # 1.5·P(TP) − P(SL) + r_to·P(TO) − cost_R
+    ev_short = ev_r(ps, cfg)
+
+    best, ev = max((Side.LONG, ev_long), (Side.SHORT, ev_short), key=lambda p: p[1])
+    if ev < cfg.min_ev_r:
+        return HOLD(f"EV {ev:+.2f}R below the {cfg.min_ev_r:+.2f}R minimum")
+    side = best
 
     # ── Levels: same arithmetic as the simulator, so what you see is
     #    exactly what the model was trained on
@@ -1868,9 +1991,15 @@ def decide(symbol: str, as_of: date) -> Decision:
     )
 ```
 
-`theta_long` / `theta_short` are tuned on **validation folds only**, to maximize expectancy
-(not accuracy), then **frozen and stored with the model artifact.** A threshold that drifts
-between runs makes your track record uninterpretable.
+`min_ev_r` lives in `config.toml` and is **not** re-tuned per run. It's an economic
+statement — "only take trades worth at least +$10 per $100 risked" — so it belongs in
+version-controlled config where you can see it change, not in a fitted artifact. This is
+the main practical payoff of the 3-class target (§8.2): the knob is a dollar amount you
+can reason about rather than a probability cut-off you have to tune.
+
+Since nothing is stored (§5), there's no model artifact for a threshold to drift inside.
+`min_ev_r` is the one number that must stay fixed across runs for your track record to
+mean anything.
 
 > **The `ABSTAIN` on stale data is deliberate.** If the fetch failed and the newest bar is
 > three days old, the system must **refuse to answer** rather than quietly deciding on stale
@@ -1883,10 +2012,10 @@ Everything is denominated in dollars and units — you shouldn't have to compute
 place the order:
 
 ```
-NVDA   LONG   conf 0.71
+NVDA   LONG   EV +$19 per $100 risked     P(TP) 0.51  P(SL) 0.32  P(TIMEOUT) 0.17
   entry  ~$183.40    (indicative; actual fill is tomorrow's open)
-  TP      $196.10     +$200 if hit
-  SL      $177.05     −$100 if hit
+  TP      $189.12     +3.1%   →  +$149 if hit
+  SL      $179.59     −2.1%   →  −$99 if hit
   size     26 units  = $4,768 notional, $477 margin
   hold    ≤ 10 trading days, then exit at market
   because  EMA21 slope +0.8σ · ADX 31 · RSI 58 · %B 0.74 · RS rank 94th
@@ -1900,8 +2029,11 @@ sum across open trades, and it's what tells you whether to take the next signal.
 > **TP/SL are displayed as dollar prices but computed as ATR multiples** (§8.2). A fixed
 > dollar stop can't work across the universe — $3.81 is a normal day's move for NVDA and a
 > catastrophic one for a $20 stock, so a fixed figure would be far too tight on some
-> tickers and far too loose on others. The ATR scaling is what makes one rule work for all
-> 50. You just never have to see it.
+> tickers and far too loose on others. The ATR scaling is what makes one rule work for
+> every ticker. You just never have to see it.
+>
+> Candidates are **ranked by EV**, so when more signals clear `min_ev_r` than you have
+> free slots, the best-priced ones get taken. A probability threshold couldn't rank them.
 
 Written to stdout as a `rich` table, to `reports/decisions_YYYY-MM-DD.{md,csv}`, and as one
 appended line in `decisions.jsonl`.
@@ -1928,14 +2060,16 @@ accumulate: after six months it's worth more than any amount of backtesting. Nev
 
 Worth calibrating before you see a number, so you can tell success from self-deception.
 
-- At R:R 2.0, break-even is a 33% hit rate ignoring costs — but **~42% once spread,
+- At R:R 1.5, break-even is a 40% hit rate ignoring costs — but **50% once spread,
   slippage and 10 days of financing are included** (§10.3). Judge expectancy, not accuracy.
-- ⚠️ **That 42% is uncomfortably close to the ~45% that counts as a genuinely good result.**
-  The realistic gap between "works" and "doesn't" is a few percentage points of hit rate.
-  Two implications: the cost parameters need to be *your real ones*, and wider TP/SL
-  profiles deserve a serious look since they amortize fixed costs better.
-- Out-of-sample precision at threshold around **0.50–0.60** is a solid outcome for daily-bar
-  technical features — and that comfortably clears 42%, which is where the opportunity is.
+- ⚠️ **`P(TP)` has to clear 50%, which is a demanding bar.** Because the target sits nearer
+  than a 2-ATR one the *achievable* hit rate is also higher — a model with ~10 points of
+  skill over a ~40% base rate lands around 50%, i.e. right at break-even. **The margin is
+  thin by construction at this profile**, which is why §10.3 recommends running
+  `labels sweep` over 1.5/1.0, 2.0/1.0 and 3.0/1.5 before settling on it.
+- Expressed as expected value — what §11 actually decides on — a solid outcome is
+  **+0.10 to +0.25 R per trade** (+$10 to +$25 per $100 risked). Below +0.10 R the costs
+  own your edge.
 - ⚠️ **If your first run shows >65% out-of-sample accuracy, or a smooth upward equity curve,
   you have a bug — not an edge.** Go back to §9.4. This is the *expected* failure mode, not
   a remote one.
@@ -2001,8 +2135,8 @@ market      = "^GSPC"                 # S&P 500 INDEX, not an ETF
 volatility  = "^VIX"                  # no volume; price only
 peer_proxy  = "universe_median"       # sector comparison, from your own tickers
 
-[labels]                              # the "label profile" — hashed into run_id
-k_tp        = 2.0                     # take-profit, in ATR
+[labels]                              # the "label profile"
+k_tp        = 1.5                     # take-profit, in ATR
 k_sl        = 1.0                     # stop-loss, in ATR
 horizon     = 10                      # max holding period, trading days. NOT unbounded —
                                       # see §8.2 for the four reasons why
@@ -2035,6 +2169,12 @@ features        = "minimal"           # minimal | core | extended — match to
                                       # universe size (§6.3)
 holdout_months  = 12
 embargo_bars    = 10
+
+[decide]
+min_ev_r    = 0.10                    # minimum expected value to trade, in R.
+                                      # 0.10 = +$10 per $100 risked (§11).
+                                      # NOT fitted — an economic choice, kept in
+                                      # version control so changes are visible.
 ```
 
 ### Settings you may want to revisit
@@ -2043,7 +2183,8 @@ embargo_bars    = 10
 |---|---|---|
 | `max_concurrent` | 10 | Lower to 5 if "−10% in a day" (§10.2) is more than you want. Note it can't bind above your ticker count |
 | `costs.*` | estimates | As soon as you can read your real spread and overnight fee off the platform — they move break-even by ~8 points (§10.3) |
-| `k_tp` / `k_sl` | 2.0 / 1.0 | After `labels sweep` — wider profiles amortize fixed costs better |
+| `k_tp` / `k_sl` | 1.5 / 1.0 | **Soon.** Break-even with costs is 50% at this profile vs 41.7% at TP 2.0 (§10.3). Run `labels sweep` across 1.5/1.0, 2.0/1.0 and 3.0/1.5 before settling |
+| `min_ev_r` | 0.10 | Raise it to trade less and better; every trade pays the fixed cost again (§10.3) |
 | `features` | `minimal` | Move to `core` once `minimal` shows signal, or if you grow the universe past ~20 tickers (§6.3) |
 | `universe` | ~15 tickers | Adding tickers is the cheapest way to buy statistical power and the only way to get a holdout verdict you can size up on (§5) |
 | `earnings_calendar` | `false` | Before sizing up — a real calendar beats the proxy, and earnings is the only knowable tail risk (§10.4) |
@@ -2069,9 +2210,10 @@ boosting.
 
 ### The cheap levers, in order
 
-**1. The dataset snapshot already removes fetch from the loop.** `tdm dataset build` writes
-Parquet keyed by config hash (§5); every subsequent `tdm train` reads that file. You pay
-the download once, then iterate offline. This is the single biggest win and it's automatic.
+**1. Do several things per invocation.** Nothing is stored (§5), so each process pays the
+fetch once — which means `tdm train --compare` fitting three models in one run costs one
+download, while three separate commands cost three. This is also required for the
+comparison to be valid at all (§5).
 
 **2. Use a fast profile while exploring, the real one to conclude:**
 

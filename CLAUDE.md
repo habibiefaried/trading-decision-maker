@@ -81,13 +81,14 @@ warm-up periods filled with 0 instead of NaN, features that are flat for 200 bar
 
 ## 4. Hard rules that exist to stop specific, known bugs
 
-1. **There is no database.** The pipeline is stateless: re-download each run,
-   `auto_adjust=True`, recompute everything. Do not add SQLite, a schema, migrations,
-   coverage tracking or cache-invalidation logic. (§5)
-2. **Snapshot the dataset, not the bars.** `data/datasets/<run_id>.parquet` where
-   `run_id = hash(tickers, date range, feature config, code version)`, plus a line in
-   `runs.jsonl`. This exists so two model runs are comparable; without it you cannot tell a
-   worse model from a changed dataset. (§5)
+1. **Nothing is stored. Everything runs in memory, in one process.** Re-download each run,
+   `auto_adjust=True`, recompute everything. No database, no Parquet cache, no feature
+   store, no saved model artifact. Do not add any. (§5)
+2. **Model comparison must happen inside one invocation.** Two runs see different data (at
+   minimum one extra bar), so numbers from separate runs aren't comparable.
+   `tdm train --compare` fits all models on the same in-memory dataset. The only things
+   written to disk are `reports/charts/*.html` (output) and `decisions.jsonl` (a logbook
+   that cannot be recomputed — never delete it). (§5)
 3. **Match the feature set to the universe size.** `minimal` (18) at ~15 tickers, `core`
    (40) at 20–40, `extended` beyond that. Keep ≥100 effective samples per feature; at 15
    tickers that is ~3,400 ÷ 18. Using all ~118 features on a small universe is ~29 samples
@@ -119,6 +120,9 @@ warm-up periods filled with 0 instead of NaN, features that are flat for 200 bar
     tuning against it. (§9.2)
 11. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in both
     the simulator and the backtest. The two must never disagree. (§8.2, §10)
+    **The target is 3-class: `TP` / `SL` / `TIMEOUT`.** TIMEOUT is a real outcome, not a
+    degenerate case to fold into win/loss by sign — folding it destroys the information
+    §11 needs to price the trade. `loss_function="MultiClass"`. (§8.2)
 12. **Entry price must be knowable at decision time.** Never `(high[t]+low[t])/2` or
     anything else derived from bar `t`'s high/low — those aren't known until the day is
     over, and a mid-range fill is worth ~48% of the risk budget in phantom edge. Legal
@@ -129,9 +133,15 @@ warm-up periods filled with 0 instead of NaN, features that are flat for 200 bar
 13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
     `min_liquidity` and the gap filter run at sample-construction time too — otherwise you
     train on regimes you will never trade in (e.g. March 2020 at 10× leverage). (§9.1)
-14. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
-    costs and **~42% after** spread, slippage and financing. Accuracy is close to
-    meaningless here. (§9.3, §10.3)
+14. **Decide on expected value, not a probability threshold.**
+    `EV_R = 1.5·P(TP) − P(SL) + r_to·P(TIMEOUT) − 0.25`, and trade when it clears
+    `min_ev_r` (default 0.10 R = +$10 per $100 risked). `min_ev_r` lives in `config.toml`,
+    is never fitted, and must stay fixed across runs or the track record is
+    uninterpretable. Rank candidates by EV when slots are scarce.
+    **Calibration matters more than accuracy** — EV is computed from the three
+    probabilities, so they must be numerically right, not merely well-ranked. Check
+    reliability curves per class. At TP 1.5 / SL 1.0, break-even is a 40% hit rate before
+    costs and **50% after**. (§11, §8.2, §9.3, §10.3)
 15. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
     affects the margin a position ties up, nothing else. Getting this backwards is how
     leveraged accounts die. (§10.2)
@@ -170,8 +180,8 @@ Package constraints:
 
 ## 6. Don't commit data
 
-`data/`, `models/`, `reports/`, `*.parquet`, `runs.jsonl` are gitignored and must stay that
-way. All of it is re-derivable from `make fetch` onward.
+`reports/` is gitignored and must stay that way — charts and decision reports are
+re-derivable output. There is no `data/` or `models/` directory to worry about (§5).
 
 **One exception worth knowing:** `decisions.jsonl` (§11) is the log of calls the system
 actually issued, and it is the only genuinely out-of-sample record that will ever exist. It

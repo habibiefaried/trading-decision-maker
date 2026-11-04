@@ -47,14 +47,15 @@ make daily        # fetch -> features -> dataset -> decide
 ```
 
 ```
-NVDA   LONG   conf 0.71
+NVDA   LONG   EV +$19 per $100 risked     P(TP) 0.51  P(SL) 0.32  P(TIMEOUT) 0.17
   entry  ~$183.40    (indicative; actual fill is tomorrow's open)
-  TP      $196.10     +$200 if hit
-  SL      $177.05     −$100 if hit
+  TP      $189.12     +3.1%   →  +$149 if hit
+  SL      $179.59     −2.1%   →  −$99 if hit
   size     26 units  = $4,768 notional, $477 margin
   hold    ≤ 10 trading days, then exit at market
 
-AMD    HOLD   conf 0.48   — no edge: ADX 14 (choppy), gap-risk window
+AMD    HOLD   EV −$12      P(TP) 0.31  P(SL) 0.38  P(TIMEOUT) 0.31
+                           — below the +$10 minimum; ADX 14 (choppy)
 
 account: 3 of 10 slots used · $1,431 of $5,000 margin · $300 currently at risk
 ```
@@ -69,16 +70,16 @@ make fetch                                       # download 9 years of daily OHL
 ./venv/bin/python -m tdm.cli fetch --symbols MSFT,NVDA --years 9
 ```
 
-No database — each run re-downloads. `config/universe.txt` is exactly the stocks you want
-to trade; the market index `^GSPC` and `^VIX` are fetched separately as reference data for
-a few feature columns and are never traded.
+**Nothing is stored** — each run downloads and recomputes everything in memory.
+`config/universe.txt` is exactly the stocks you want to trade; the market index `^GSPC`
+and `^VIX` are fetched separately as reference data for a few feature columns and are
+never traded.
 
 ### Features
 
 ```bash
-make features                                    # -> data/features/<run_id>.parquet
-./venv/bin/python -m tdm.cli features build --set minimal   # minimal | core | extended
-./venv/bin/python -m tdm.cli features export --format csv --out data/exports/
+./venv/bin/python -m tdm.cli features --set minimal    # minimal | core | extended
+./venv/bin/python -m tdm.cli features --dump-csv out.csv
 ```
 
 ### Charts
@@ -99,12 +100,12 @@ obvious on a chart and nearly invisible in a metric.
 ```bash
 make dataset                                     # features + target columns
 ./venv/bin/python -m tdm.cli labels sweep        # compare TP/SL/horizon profiles
-./venv/bin/python -m tdm.cli dataset export --format csv   # -> data/exports/
-./venv/bin/python -m tdm.cli dataset schema      # column list, dtypes, tier
+./venv/bin/python -m tdm.cli dataset --dump-csv out.csv    # optional, on demand
+./venv/bin/python -m tdm.cli dataset --schema    # column list, dtypes, tier
 ```
 
-One row per `(symbol, date)`: identity, raw OHLCV, the feature columns, `y_*` target
-columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §8.1.
+One row per `(symbol, date)`: identity, raw OHLCV, the feature columns, `y_long` /
+`y_short` (3-class: `TP` / `SL` / `TIMEOUT`), and `fwd_*` diagnostics. See DESIGN.md §8.1.
 
 ### Train & evaluate
 
@@ -136,7 +137,7 @@ make decide
 | File | Purpose |
 |---|---|
 | `config/universe.txt` | **your** tickers, one per line, any number. Stocks only |
-| `config/config.toml` | horizon, ATR multiples, entry mode, costs, position sizing |
+| `config/config.toml` | horizon, ATR multiples, entry mode, costs, sizing, `min_ev_r` |
 | `config/feature_sets/*.toml` | `minimal` / `core` / `extended` |
 
 Full reference: DESIGN.md §14.
@@ -144,14 +145,13 @@ Full reference: DESIGN.md §14.
 ## Layout
 
 ```
-data/            Parquet feature/dataset snapshots, CSV exports   (gitignored)
-models/          trained artifacts + frozen thresholds            (gitignored)
 reports/         charts/, equity.html, daily decisions            (gitignored)
-runs.jsonl       append-only provenance log                       (gitignored)
 decisions.jsonl  every call the system issued — never delete      (gitignored)
 src/tdm/         the package
 tests/           see tests/test_leakage.py — the most important tests here
 ```
+
+No `data/` or `models/` directory — nothing is cached or persisted (DESIGN.md §5).
 
 ## Development
 
