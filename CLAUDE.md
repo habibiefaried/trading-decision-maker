@@ -119,21 +119,32 @@ warm-up periods filled with 0 instead of NaN, features that are flat for 200 bar
     tuning against it. (§9.2)
 11. **Resolve same-bar TP+SL touches pessimistically** (assume the stop hit first), in both
     the simulator and the backtest. The two must never disagree. (§8.2, §10)
-12. **Filter training samples through the same gates `decide` uses.** `max_vol`,
+12. **Entry price must be knowable at decision time.** Never `(high[t]+low[t])/2` or
+    anything else derived from bar `t`'s high/low — those aren't known until the day is
+    over, and a mid-range fill is worth ~48% of the risk budget in phantom edge. Legal
+    modes are `next_open` (default), `close`, and `limit_pullback` (a limit at
+    `close[t] ± offset×ATR`, filled only if bar `t+1` trades through it). Horizon must
+    stay bounded — unbounded breaks purging and collapses effective sample size to ~340.
+    (§8.2)
+13. **Filter training samples through the same gates `decide` uses.** `max_vol`,
     `min_liquidity` and the gap filter run at sample-construction time too — otherwise you
     train on regimes you will never trade in (e.g. March 2020 at 10× leverage). (§9.1)
-13. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
+14. **Report expectancy, not accuracy.** At 2:1 R:R break-even is a ~33% hit rate before
     costs and **~42% after** spread, slippage and financing. Accuracy is close to
     meaningless here. (§9.3, §10.3)
-14. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
+15. **Leverage never multiplies position size.** Size from `risk_frac` only; leverage
     affects the margin a position ties up, nothing else. Getting this backwards is how
     leveraged accounts die. (§10.2)
-15. **No ETFs in decisions, but always fetch them.** SPY and sector ETFs are benchmark
-    inputs for the relative-strength and regime features. They carry `tradeable=False` and
-    are filtered at the decision step, never at fetch. (§5, §6.3)
-16. **Long and short are one code path with a sign flip.** We trade CFDs — no share borrow,
+16. **No ETFs anywhere — but `^GSPC` and `^VIX` are still required.** They are *indices*,
+    not ETFs, fetched as **reference series**: inputs to the relative-strength and regime
+    feature columns only. They produce no dataset rows, get no decisions, and appear
+    nowhere in the output. Don't delete them — three of the 18 `minimal` features depend
+    on a market series, including `rs_rank`, the strongest single feature in the set.
+    Sector comparison uses the peer median of the user's own universe, not sector ETFs.
+    (§5, §6.3)
+17. **Long and short are one code path with a sign flip.** We trade CFDs — no share borrow,
     no uptick rule, no shortability check. Don't add that logic. (§10.1)
-17. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
+18. **Models: CatBoost is primary, RandomForest is a required control.** If RF matches or
     beats CatBoost on the holdout, CatBoost is overfit — report both, always. Keep the
     depth-4 tree permanently as the readable baseline. Shallow and heavily regularized:
     `depth=4`, `learning_rate=0.03`, `l2_leaf_reg≈10`, `od_type="Iter"`. Leave

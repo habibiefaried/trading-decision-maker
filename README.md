@@ -1,7 +1,7 @@
 # trading-decision-maker
 
-Daily LONG / SHORT / HOLD decisions for US stocks & ETFs, with explicit
-take-profit and stop-loss levels.
+Daily LONG / SHORT / HOLD decisions for US stocks, with explicit take-profit and
+stop-loss prices.
 
 > **Status: design phase.** The architecture and reasoning live in
 > [DESIGN.md](DESIGN.md). No code has been written yet — the commands below are the
@@ -30,14 +30,20 @@ Always invoke the interpreter explicitly as `./venv/bin/python`, or use `make`.
 ## Daily use
 
 ```bash
-make daily            # fetch -> features -> decide. The once-a-day command.
+make daily        # fetch -> features -> dataset -> decide
 ```
 
-Writes `reports/decisions_YYYY-MM-DD.md` and prints:
-
 ```
-NVDA   LONG    conf 0.71   entry 183.40   TP 196.10 (+6.9%)   SL 177.05 (-3.5%)   R:R 2.0   hold <= 10d
-AMD    HOLD    conf 0.48   — no edge: ADX 14 (chop), earnings in 3 days
+NVDA   LONG   conf 0.71
+  entry  ~$183.40    (indicative; actual fill is tomorrow's open)
+  TP      $196.10     +$200 if hit
+  SL      $177.05     −$100 if hit
+  size     26 units  = $4,768 notional, $477 margin
+  hold    ≤ 10 trading days, then exit at market
+
+AMD    HOLD   conf 0.48   — no edge: ADX 14 (choppy), gap-risk window
+
+account: 3 of 10 slots used · $1,431 of $5,000 margin · $300 currently at risk
 ```
 
 ## Commands
@@ -45,59 +51,57 @@ AMD    HOLD    conf 0.48   — no edge: ADX 14 (chop), earnings in 3 days
 ### Data
 
 ```bash
-./venv/bin/python -m tdm.cli universe validate # check tickers before downloading
-make fetch                                    # incremental; skips what's already cached
-./venv/bin/python -m tdm.cli fetch --symbols NVDA,AMD --since 2018-11-01
-./venv/bin/python -m tdm.cli fetch --dry-run  # print the fetch plan, make no HTTP calls
-./venv/bin/python -m tdm.cli fetch --force --symbols NVDA   # ignore cache, re-pull
-./venv/bin/python -m tdm.cli db status        # coverage, gaps, staleness per symbol
-./venv/bin/python -m tdm.cli db verify        # OHLC sanity checks
+./venv/bin/python -m tdm.cli universe validate   # check tickers BEFORE downloading
+make fetch                                       # download 9 years of daily OHLCV
+./venv/bin/python -m tdm.cli fetch --symbols MSFT,NVDA --years 9
 ```
 
-Prices are cached in `data/market.db` (SQLite). Re-running `make fetch` the same day
-makes zero network calls.
+No database — each run re-downloads. `config/universe.txt` is exactly the stocks you want
+to trade; the market index `^GSPC` and `^VIX` are fetched separately as reference data for
+a few feature columns and are never traded.
 
-### Features & labels
+### Features
 
 ```bash
-make features                                 # -> data/features/<run_id>.parquet
-./venv/bin/python -m tdm.cli features build --set extended
+make features                                    # -> data/features/<run_id>.parquet
+./venv/bin/python -m tdm.cli features build --set minimal   # minimal | core | extended
 ./venv/bin/python -m tdm.cli features export --format csv --out data/exports/
-./venv/bin/python -m tdm.cli features export --format sqlite --table feature_long
-
-make label                                    # triple-barrier labels
-./venv/bin/python -m tdm.cli labels sweep      # compare TP/SL/horizon profiles
-
-./venv/bin/python -m tdm.cli dataset build     # features + targets, one flat table
-./venv/bin/python -m tdm.cli dataset export --format csv   # -> data/exports/
-./venv/bin/python -m tdm.cli dataset schema    # column list, dtypes, CORE/EXT tier
 ```
-
-The dataset is one row per `(symbol, date)`: identity, raw OHLCV, the feature columns,
-`y_*` target columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §8.1.
 
 ### Charts
 
 ```bash
-make charts                                   # -> reports/charts/<ticker>.html
-./venv/bin/python -m tdm.cli chart --ticker NVDA
-./venv/bin/python -m tdm.cli chart --ticker NVDA --with-labels     # TP/SL outcomes
-./venv/bin/python -m tdm.cli chart --ticker NVDA --with-decisions  # model calls
+make charts                                      # -> reports/charts/<ticker>.html
+./venv/bin/python -m tdm.cli chart --ticker MSFT
+./venv/bin/python -m tdm.cli chart --ticker MSFT --with-labels     # TP/SL outcomes
+./venv/bin/python -m tdm.cli chart --ticker MSFT --with-decisions  # model calls
 ```
 
 Interactive Plotly HTML: candlesticks with every overlay, plus linked subpanels for RSI,
 MACD, ADX, Stochastic and volume. **Look at these before training** — feature bugs are
 obvious on a chart and nearly invisible in a metric.
 
+### Dataset
+
+```bash
+make dataset                                     # features + target columns
+./venv/bin/python -m tdm.cli labels sweep        # compare TP/SL/horizon profiles
+./venv/bin/python -m tdm.cli dataset export --format csv   # -> data/exports/
+./venv/bin/python -m tdm.cli dataset schema      # column list, dtypes, tier
+```
+
+One row per `(symbol, date)`: identity, raw OHLCV, the feature columns, `y_*` target
+columns, and `fwd_*` forward-return diagnostics. See DESIGN.md §8.1.
+
 ### Train & evaluate
 
 ```bash
-make train                                     # purged walk-forward CV
+make train                                       # purged walk-forward CV
 ./venv/bin/python -m tdm.cli train --model decision_tree    # readable baseline
 ./venv/bin/python -m tdm.cli train --model catboost         # primary
 ./venv/bin/python -m tdm.cli train --model rf               # required control
 ./venv/bin/python -m tdm.cli train --compare                # all three, same folds
-./venv/bin/python -m tdm.cli train --fast                   # quick, for iteration only
+./venv/bin/python -m tdm.cli train --fast                   # quick; iteration only
 ./venv/bin/python -m tdm.cli train --side long              # halve the work
 ./venv/bin/python -m tdm.cli explain --run-id <id>          # rules + importances
 
@@ -118,19 +122,22 @@ make decide
 
 | File | Purpose |
 |---|---|
-| `config/universe.txt` | **your** tickers, one per line, any number. Stocks only — no ETFs needed |
-| `config/config.toml` | horizon, ATR multiples, costs, thresholds, position sizing |
-| `config/feature_sets/*.toml` | which indicators to compute |
+| `config/universe.txt` | **your** tickers, one per line, any number. Stocks only |
+| `config/config.toml` | horizon, ATR multiples, entry mode, costs, position sizing |
+| `config/feature_sets/*.toml` | `minimal` / `core` / `extended` |
+
+Full reference: DESIGN.md §14.
 
 ## Layout
 
 ```
-data/        Parquet feature/label snapshots, CSV exports   (gitignored)
-models/      trained artifacts + frozen thresholds          (gitignored)
-reports/     charts/, equity.html, daily decisions          (gitignored)
-runs.jsonl   append-only provenance log                     (gitignored)
-src/tdm/     the package
-tests/       see tests/test_leakage.py — the most important tests here
+data/            Parquet feature/dataset snapshots, CSV exports   (gitignored)
+models/          trained artifacts + frozen thresholds            (gitignored)
+reports/         charts/, equity.html, daily decisions            (gitignored)
+runs.jsonl       append-only provenance log                       (gitignored)
+decisions.jsonl  every call the system issued — never delete      (gitignored)
+src/tdm/         the package
+tests/           see tests/test_leakage.py — the most important tests here
 ```
 
 ## Development
@@ -142,6 +149,6 @@ make lint
 
 ## Disclaimer
 
-Research and decision-support tooling. It does not place orders and it is not
-financial advice. Read [DESIGN.md §12](DESIGN.md) for what results to realistically
-expect before trading on anything this produces.
+Research and decision-support tooling. It does not place orders and it is not financial
+advice. Read [DESIGN.md §12](DESIGN.md) for what results to realistically expect before
+trading on anything this produces.

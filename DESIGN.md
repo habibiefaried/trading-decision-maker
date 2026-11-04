@@ -42,6 +42,7 @@ $177.05, whichever comes first. Give up after 10 days either way.*
 | Take-profit | 2.0 × ATR from entry |
 | Stop-loss | 1.0 × ATR from entry |
 | Max holding period | 10 trading days |
+| Entry | next day's open (two alternatives in §8.2) |
 | Directions | Long and short |
 | Account | $10,000, risk 1% per trade, max 10 concurrent positions |
 | Primary model | CatBoost (gradient-boosted trees) |
@@ -1180,6 +1181,54 @@ It's a config value, not a law. `tdm labels sweep` reports the timeout fraction:
 trades are timing out, `H` is too short** or the TP is too far; if almost none are, `H`
 isn't doing any work and you're paying financing for nothing.
 
+> #### ⚠️ Why `H` can't be unbounded ("hold until it hits one or the other")
+>
+> Scanning forward indefinitely until a barrier fires is the natural reading of "will it
+> hit TP or SL *eventually*", and it fails for four separate reasons — any one of which
+> would be disqualifying.
+>
+> **1. It destroys cross-validation.** §9.2 purges every training sample whose `[t, t1]`
+> interval overlaps the test fold. That works because `t1 ≤ t + 10`. With unbounded `t1`,
+> a sample from 2019 can resolve in 2023, so purging a 2023 test fold would remove most of
+> the training set. There is no valid split left.
+>
+> **2. Effective sample size collapses.** Overlapping labels are not independent (decision
+> 5 below), so effective samples ≈ `rows ÷ H`:
+>
+> | Horizon | Effective samples (15 tickers) |
+> |---|---|
+> | **10** | **~3,400** ✓ |
+> | 20 | ~1,700 |
+> | 30 | ~1,100 |
+> | 60 | ~570 |
+> | unbounded (~100-day average) | **~340** ✗ |
+>
+> At ~340 you cannot fit anything that generalizes — even the 18-feature `minimal` set
+> would be ~19 samples per feature.
+>
+> **3. Some labels never resolve.** A position that drifts sideways until the data runs out
+> has no outcome. Those rows get dropped, and they're concentrated in the **most recent**
+> months — exactly the period you care most about.
+>
+> **4. Financing eats the win.** At 0.02%/day on notional (§10.1), a 200-day hold costs 4%
+> of notional — which at 10× leverage is **40% of the margin posted.** The trade can hit
+> its TP on price and still lose money on carry.
+>
+> There's also a statistical curiosity worth knowing: with infinite time and barriers at
+> +2 / −1 ATR, a driftless random walk hits the nearer barrier first about two-thirds of
+> the time, giving a base rate near 33% — which is almost exactly break-even before costs
+> (§10.3). So removing the timeout doesn't just break the machinery; it converges the label
+> toward "no edge by construction".
+>
+> **What the design does instead** is the practical version of "eventually": scan forward
+> up to `H`, and if neither barrier has fired, close at market and label by whether the
+> result was profitable net of costs. Every row resolves, `t1` stays bounded, and nothing
+> is discarded.
+>
+> If 10 days feels short, sweep it — `tdm labels sweep --horizon 10,20,30` prices the
+> trade-off in effective samples against timeout fraction, and you can pick with the
+> numbers in front of you. Just don't set it to infinity.
+
 ### Five design decisions
 
 **1. Same-bar ambiguity resolves pessimistically.** If a daily bar's high reaches TP *and*
@@ -1190,9 +1239,9 @@ where it hurts most: in high-volatility bars, which is where wide-TP trades live
 them instead would bias the training set toward calm periods. The ambiguous count is logged
 every run; above ~5% of samples, the barriers are too tight for daily bars.
 
-**2. Fill at the next open, not today's close.** Deciding at bar `t`'s close and claiming a
-fill at that same close assumes you traded using information from a price you then got.
-`open[t+1]` is what you can actually do.
+**2. Entry price must be knowable when you decide.** This sounds obvious and is the
+easiest place in the whole design to introduce a lookahead bug, so it gets its own
+treatment below.
 
 **3. Costs go inside the label, not bolted on afterward.** `net_return` subtracts the CFD
 spread, slippage (a fraction of ATR — execution noise scales with volatility, so fixed
@@ -1228,6 +1277,80 @@ Standard CV treats them as if they were, which inflates every metric. Two correc
 **Practical consequence:** 15 tickers × ~2,268 bars ≈ 34,000 rows, but the **effective
 independent sample count is ~3,400.** That smaller number is what governs model
 complexity, and it's why §6.3 recommends 18 features rather than 118.
+
+### Entry price: what you can and can't use
+
+The simulator needs an entry price for every row. The constraint is that it must be a price
+**you could actually have transacted at, using only information available when the decision
+was made** (bar `t`'s close).
+
+> #### ⚠️ Why the mid-range price `(high + low) / 2` cannot be used
+>
+> Entering at the midpoint of the day's range is an appealing idea — it looks like a fair,
+> average fill rather than an optimistic one. It is unfortunately **not implementable**, and
+> it inflates results badly.
+>
+> The problem: `high[t]` and `low[t]` are not known until day `t` has closed. By the time
+> you can compute the midpoint, the day is over and that price is gone. Using it means the
+> simulator transacts at a price that was only identifiable in hindsight.
+>
+> **How much it's worth.** The midpoint is, by construction, guaranteed to sit inside the
+> day's range — so a midpoint entry can *never* have bought the high or sold the low. A
+> real entry has no such guarantee. That structural advantage is worth roughly half the
+> daily range:
+>
+> | | |
+> |---|---|
+> | Position notional (the §10.2 example) | $4,768 |
+> | Daily range ≈ ATR | ~2% of price |
+> | Half the range | 1.0% = **$48** |
+> | Risk budget per trade | $100 |
+> | **Phantom edge from a mid-range fill** | **$48 — 48% of the risk budget, 24% of the TP target** |
+>
+> A free $48 per trade against a $100 risk budget turns a losing strategy into a winning
+> one on paper. The backtest would look excellent and live results would not resemble it,
+> with no error anywhere to explain the gap.
+>
+> This is the §9.4 bug class in its most tempting form: a reasonable-sounding entry
+> assumption that quietly reads the future.
+
+### The implementable options
+
+`entry_mode` in `config.toml` selects between these. All three use only information
+available at bar `t`'s close.
+
+| `entry_mode` | Entry price | Notes |
+|---|---|---|
+| **`next_open`** (default) | `open[t+1]` | Decide on tonight's close, order fills at tomorrow's opening print. Simplest, always fills, and the most conservative of the three — you accept whatever the overnight gap did. |
+| `close` | `close[t]` | You place the order into the closing minutes. Realistic on a CFD platform that trades continuously, and it removes overnight gap risk *from the entry* (not from the position). Slightly more aggressive, since you're deciding on a price you then transact at. |
+| `limit_pullback` | `close[t] − offset × ATR` for a long, `+` for a short | ⬇ see below |
+
+> #### `limit_pullback` — the honest version of "enter somewhere during the day"
+>
+> If the intent behind a mid-range entry is *"I want a better price than the open, by
+> entering on an intraday dip"*, this is how to express that without lookahead:
+>
+> 1. At bar `t`'s close, compute the limit price from `close[t]` and `ATR[t]` — both known
+>    now. Default `offset = 0.25`.
+> 2. Place a resting limit order for bar `t+1`.
+> 3. **It fills only if `low[t+1] <= limit`** (for a long). Otherwise there is no trade,
+>    and the row is recorded as `y_long_reason = "no_fill"` and excluded from training.
+>
+> This captures the real benefit of a patient entry — a better average price — while also
+> capturing its real cost, which the mid-range version hides: **you miss the trades that
+> run away from you immediately.** Those are disproportionately the *good* ones, so the
+> better fills come at the price of lower coverage. That trade-off is genuine and
+> measurable; the mid-range version gives you the upside with none of it.
+>
+> Worth testing against `next_open` once the baseline works — `tdm labels sweep` reports
+> fill rate alongside base rate for each mode. Not the place to start, though: the
+> no-fill handling adds a branch to the simulator, the backtest and `decide`, and all
+> three have to agree (§10).
+
+> **Leakage test.** `tests/test_leakage.py` asserts that the entry price for bar `t` is a
+> function only of columns at index `≤ t`, plus `open[t+1]`/`low[t+1]`/`high[t+1]` where
+> the mode legitimately needs the *next* bar for fill determination. Any reference to
+> `high[t]` or `low[t]` in entry-price computation fails the test.
 
 ### 8.3 The parameter sweep
 
@@ -1468,6 +1591,7 @@ important file in the repo.**
 |---|---|---|
 | 1 | **No feature at date `d` uses any bar after `d`** | Property test: recompute every feature on the series truncated at `d`; assert the value at `d` is identical to the full-series computation. **This one test catches most of the rest.** |
 | 2 | ZigZag pivots respect `confirmed_at` (§6.3) | The highest-risk item |
+| 2b | **Entry price is knowable at decision time** | Entry for bar `t` may use columns at index `≤ t` plus `open/high/low[t+1]` for fill determination. Any use of `high[t]` or `low[t]` — e.g. a mid-range entry — fails (§8.2) |
 | 3 | Scalers / z-scores / percentiles use trailing windows only | Ban `.fit(X_all)`; assert window params |
 | 4 | No target column reaches `X` | `set(X.columns) == set(registry.feature_names())`, and nothing matching `^(y_|fwd_|meta_)` (§8.1) |
 | 5 | Purging actually applied | Assert no training `[t, t1]` overlaps any test fold |
@@ -1864,8 +1988,11 @@ peer_proxy  = "universe_median"       # sector comparison, from your own tickers
 [labels]                              # the "label profile" — hashed into run_id
 k_tp        = 2.0                     # take-profit, in ATR
 k_sl        = 1.0                     # stop-loss, in ATR
-horizon     = 10                      # max holding period, trading days
+horizon     = 10                      # max holding period, trading days. NOT unbounded —
+                                      # see §8.2 for the four reasons why
 atr_period  = 14
+entry_mode  = "next_open"             # next_open | close | limit_pullback (§8.2)
+entry_offset_atr = 0.25               # only used by limit_pullback
 
 [costs]                               # ⚠️ replace with your real IQ Option numbers
 spread_pct        = 0.10              # round-trip, % of notional
